@@ -71,11 +71,10 @@ fn parse_line<const N: usize>(line: S, out: &mut [S; N]) -> bool {
 
 // ---------- timestamps ----------
 #[inline(always)]
-fn d2(b: &[u8], i: usize) -> Option<i64> {
-    let a = b[i].wrapping_sub(b'0');
-    let c = b[i + 1].wrapping_sub(b'0');
-    if a > 9 || c > 9 { return None; }
-    Some((a as i64) * 10 + c as i64)
+fn swar_d2(b: &[u8]) -> u32 {
+    let val = u16::from_le_bytes([b[0], b[1]]);
+    let val = (val & 0x0F0F) * 2561 >> 8;
+    (val & 0x00FF) as u32
 }
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
@@ -95,10 +94,33 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if n == 0 { return None; }
     
-    // Fast path: check first char for digit (most timestamps are F3 or start with digit)
+    // Fast path for F1 format: "YYYY-MM-DDTHH:MM:SSZ" (20 bytes, ~58%)
+    if n == 20 && b[19] == b'Z' {
+        // Check punctuation: - at 4,7, T at 10, : at 13,16
+        if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' { 
+            return None; 
+        }
+        // SWAR parse digit pairs
+        let y = (swar_d2(&b[0..2]) * 100 + swar_d2(&b[2..4])) as i64;
+        let mo = swar_d2(&b[5..7]) as i64;
+        let d = swar_d2(&b[8..10]) as i64;
+        let hh = swar_d2(&b[11..13]) as i64;
+        let mi = swar_d2(&b[14..16]) as i64;
+        let ss = swar_d2(&b[17..19]) as i64;
+        
+        // Validate ranges
+        if mo < 1 || mo > 12 || d < 1 || hh > 23 || mi > 59 || ss > 59 { return None; }
+        let dim = match mo { 1 | 3 | 5 | 7 | 8 | 10 | 12 => 31, 4 | 6 | 9 | 11 => 30, 
+            _ => if is_leap(y) { 29 } else { 28 } };
+        if d > dim { return None; }
+        
+        let secs = days_from_civil(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss;
+        return Some(secs * 1000);
+    }
+    
+    // F3: all digits (epoch ms, ~32%)
     let c0 = b[0];
     if c0 >= b'0' && c0 <= b'9' {
-        // Check if all digits in one pass
         let mut all_digits = true;
         for &c in b { 
             if c < b'0' || c > b'9' { all_digits = false; break; } 
@@ -114,28 +136,28 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
         }
     }
     
-    if n != 20 && n != 25 { return None; }
-    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' { return None; }
-    let y = d2(b, 0)? * 100 + d2(b, 2)?;
-    let mo = d2(b, 5)?;
-    let d = d2(b, 8)?;
-    let hh = d2(b, 11)?;
-    let mi = d2(b, 14)?;
-    let ss = d2(b, 17)?;
-    if !(1..=12).contains(&mo) || d < 1 || hh > 23 || mi > 59 || ss > 59 { return None; }
-    let dim = match mo { 1 | 3 | 5 | 7 | 8 | 10 | 12 => 31, 4 | 6 | 9 | 11 => 30, _ => if is_leap(y) { 29 } else { 28 } };
-    if d > dim { return None; }
-    let mut secs = days_from_civil(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss;
-    if n == 20 {
-        if b[19] != b'Z' { return None; }
-    } else {
-        let sign = match b[19] { b'+' => 1, b'-' => -1, _ => return None };
-        if b[22] != b':' { return None; }
-        let oh = d2(b, 20)?;
-        let om = d2(b, 23)?;
-        if oh > 23 || om > 59 { return None; }
-        secs -= sign * (oh * 3600 + om * 60);
+    // F2: "YYYY-MM-DDTHH:MM:SS±HH:MM" (25 bytes, ~10%)
+    if n != 25 { return None; }
+    if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' || b[22] != b':' { 
+        return None; 
     }
+    let y = (swar_d2(&b[0..2]) * 100 + swar_d2(&b[2..4])) as i64;
+    let mo = swar_d2(&b[5..7]) as i64;
+    let d = swar_d2(&b[8..10]) as i64;
+    let hh = swar_d2(&b[11..13]) as i64;
+    let mi = swar_d2(&b[14..16]) as i64;
+    let ss = swar_d2(&b[17..19]) as i64;
+    if mo < 1 || mo > 12 || d < 1 || hh > 23 || mi > 59 || ss > 59 { return None; }
+    let dim = match mo { 1 | 3 | 5 | 7 | 8 | 10 | 12 => 31, 4 | 6 | 9 | 11 => 30, 
+        _ => if is_leap(y) { 29 } else { 28 } };
+    if d > dim { return None; }
+    
+    let sign = match b[19] { b'+' => 1i64, b'-' => -1i64, _ => return None };
+    let oh = swar_d2(&b[20..22]) as i64;
+    let om = swar_d2(&b[23..25]) as i64;
+    if oh > 23 || om > 59 { return None; }
+    
+    let secs = days_from_civil(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss - sign * (oh * 3600 + om * 60);
     Some(secs * 1000)
 }
 
