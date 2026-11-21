@@ -827,37 +827,20 @@ impl<'a> Ctx<'a> {
 }
 
 struct Acc { camp: Vec<[u64; 4]>, asst: Vec<u32>, evbuf: Vec<Ev>, clbuf: Vec<Cl>, rows: Vec<URow>, catsum: Vec<u64>, starts: Vec<u32>, sdays: Vec<u32>, tmp: Vec<(u16, u32)>,
-    map: Vec<(u64, u32)>, pidx: Vec<u32>, cnt: Vec<u32>, estart: Vec<u32>, cstart: Vec<u32>, cpid: Vec<u32>, evs: Vec<Ev>, cls: Vec<Cl>, ord: Vec<u64> }
+    map: Vec<(u64, u32)>, np: u32, pidx: Vec<u32>, cnt: Vec<u32>, estart: Vec<u32>, cstart: Vec<u32>, cpid: Vec<u32>, evs: Vec<Ev>, cls: Vec<Cl>, ord: Vec<u64> }
 impl Acc {
     fn new(c: &Ctx<'_>) -> Self {
         Acc { camp: vec![[0; 4]; (c.ncamp + 1) * c.ndays], asst: vec![0; (c.ncamp + 1) * c.ndays], evbuf: Vec::new(), clbuf: Vec::new(), rows: Vec::new(), catsum: vec![0; c.ncat], starts: Vec::new(), sdays: Vec::new(), tmp: Vec::new(),
-            map: Vec::new(), pidx: Vec::new(), cnt: Vec::new(), estart: Vec::new(), cstart: Vec::new(), cpid: Vec::new(), evs: Vec::new(), cls: Vec::new(), ord: Vec::new() }
+            map: Vec::new(), np: 0, pidx: Vec::new(), cnt: Vec::new(), estart: Vec::new(), cstart: Vec::new(), cpid: Vec::new(), evs: Vec::new(), cls: Vec::new(), ord: Vec::new() }
     }
 }
 
 fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: &mut Acc) {
     let t0 = Instant::now();
-    // group by person with a local hash map (pk -> idx), counting-sort, then sort each person by ts
+    // grouping (map/pidx/cnt) was built during gather
     let n_in = evs_in.len();
-    let cap = (n_in * 2 + 64).next_power_of_two();
-    let mask = cap - 1;
-    acc.map.clear();
-    acc.map.resize(cap, (0u64, u32::MAX));
-    acc.pidx.clear();
-    acc.pidx.reserve(n_in);
-    let mut np: u32 = 0;
-    acc.cnt.clear();
-    for e in evs_in.iter() {
-        let mut q = (e.pk.rotate_left(NBBITS) as usize) & mask;
-        let id = loop {
-            let m = &mut acc.map[q];
-            if m.1 == u32::MAX { *m = (e.pk, np); np += 1; acc.cnt.push(0); break m.1; }
-            if m.0 == e.pk { break m.1; }
-            q = (q + 1) & mask;
-        };
-        acc.pidx.push(id);
-        acc.cnt[id as usize] += 1;
-    }
+    let np = acc.np;
+    let mask = acc.map.len() - 1;
     let npu = np as usize;
     // prefix
     acc.estart.clear(); acc.estart.reserve(npu + 1);
@@ -1104,20 +1087,21 @@ fn main() {
         for c in chunks(&[fi], usize::MAX / 4) { for_lines(c.data(), |l| if parse_line(l, &mut f) { v.push((f[0], f[1])) }); }
         v
     };
-    let prods = small(0);
-    let camps = small(1);
-    let mut cats: Vec<S> = prods.iter().map(|p| p.1).collect();
-    cats.push(b"unknown");
-    cats.sort();
-    cats.dedup();
-    let unknown_cat = cats.iter().position(|&c| c == b"unknown").unwrap() as u16;
-    let mut plook = Lookup::new(b"p");
-    for &(p, cat) in &prods { plook.insert(p, cats.binary_search(&cat).unwrap() as u16); }
-    let mut clook = Lookup::new(b"c_");
-    for (i, &(cid, _)) in camps.iter().enumerate() { clook.insert(cid, i as u16); }
-
-    // Phase 1: links -> people
-    let people = build_people(&ln_fis);
+    // small files + lookups overlap with the links -> people build
+    let ((cats, unknown_cat, plook, camps, clook), people) = rayon::join(|| {
+        let prods = small(0);
+        let camps = small(1);
+        let mut cats: Vec<S> = prods.iter().map(|p| p.1).collect();
+        cats.push(b"unknown");
+        cats.sort();
+        cats.dedup();
+        let unknown_cat = cats.iter().position(|&c| c == b"unknown").unwrap() as u16;
+        let mut plook = Lookup::new(b"p");
+        for &(p, cat) in &prods { plook.insert(p, cats.binary_search(&cat).unwrap() as u16); }
+        let mut clook = Lookup::new(b"c_");
+        for (i, &(cid, _)) in camps.iter().enumerate() { clook.insert(cid, i as u16); }
+        (cats, unknown_cat, plook, camps, clook)
+    }, || build_people(&ln_fis));
     lap("people built");
 
     // Phase 2: events + clicks parse (people resolved inline)
@@ -1170,17 +1154,17 @@ fn main() {
                 people.resolve_all(eb, |e| e.pk, |e, pk, i| { e.pk = pk; e.name = (1u32 << 31) | i; });
                 EvPart { keys: scatter_b(kb, kbk), evs: scatter(eb, |e| bucket(e.pk)), n: local }
     };
-    let cl_job = |c: &Chunk| -> (Vec<Cl>, Vec<u32>) {
+    let cl_job = |raw: &mut Vec<Cl>, c: &Chunk| -> (Vec<Cl>, Vec<u32>) {
                 let d = c.data();
-                let mut raw: Vec<Cl> = Vec::with_capacity(d.len() / 45);
+                raw.clear(); raw.reserve(d.len() / 45);
                 for_records::<4>(d, |f| {
                     if f[0].is_empty() || f[1].is_empty() { return; }
                     let ts = match if fast_ts { parse_ts_fast(f[3], dtab) } else { parse_ts(f[3]) } { Some(t) if t >= cws && t < we => t, _ => return };
                     let camp = match clook.get(f[2]) { Some(c) => c, None => return };
                     raw.push(Cl { pk: hs(f[1]), cid: c.off(f[0]), ts: (ts - base) as u32, camp });
                 });
-                resolve_clicks(&people, &mut raw);
-                scatter(&raw, |r| bucket(r.pk))
+                resolve_clicks(&people, raw);
+                scatter(raw, |r| bucket(r.pk))
     };
     // Work queue in file order (clicks, then events) so consumption follows the prefetcher's read order.
     let ncl = cch.len();
@@ -1192,10 +1176,11 @@ fn main() {
         for _ in 0..rayon::current_num_threads() {
             sc.spawn(|_| {
                 let (mut kb, mut eb, mut kbk) = (Vec::<KeyRec>::new(), Vec::<Ev>::new(), Vec::<u16>::new());
+                let mut cb = Vec::<Cl>::new();
                 loop {
                     let j = next.fetch_add(1, Relaxed);
                     if j >= njobs { break; }
-                    if j < ncl { *cl_slots[j].lock().unwrap() = Some(cl_job(&cch[j])); }
+                    if j < ncl { *cl_slots[j].lock().unwrap() = Some(cl_job(&mut cb, &cch[j])); }
                     else { let ci = j - ncl; *ev_slots[ci].lock().unwrap() = Some(ev_job(&mut kb, &mut eb, &mut kbk, ci, &ech[ci])); }
                 }
             });
@@ -1258,16 +1243,37 @@ fn main() {
         let mut evs = std::mem::take(&mut acc.evbuf);
         let mut cls = std::mem::take(&mut acc.clbuf);
         evs.clear();
-        evs.reserve(ev_parts.iter().map(|p| (p.evs.1[b + 1] - p.evs.1[b]) as usize).sum());
+        let nb_ev: usize = ev_parts.iter().map(|p| (p.evs.1[b + 1] - p.evs.1[b]) as usize).sum();
+        evs.reserve(nb_ev);
+        let cap = (nb_ev * 2 + 64).next_power_of_two();
+        let mask = cap - 1;
+        acc.map.clear();
+        acc.map.resize(cap, (0u64, u32::MAX));
+        acc.pidx.clear();
+        acc.pidx.reserve(nb_ev);
+        acc.cnt.clear();
+        let mut np: u32 = 0;
         cls.clear();
         cls.reserve(cl_parts.iter().map(|p| (p.1[b + 1] - p.1[b]) as usize).sum());
         for p in &ev_parts {
             let (v, off) = &p.evs;
             for e in &v[off[b] as usize..off[b + 1] as usize] {
                 let gi = gidx(e.rid);
-                if losers[gi >> 6].load(Relaxed) & (1u64 << (gi & 63)) == 0 { evs.push(*e); }
+                if losers[gi >> 6].load(Relaxed) & (1u64 << (gi & 63)) == 0 {
+                    evs.push(*e);
+                    let mut q = (e.pk.rotate_left(NBBITS) as usize) & mask;
+                    let id = loop {
+                        let m = unsafe { acc.map.get_unchecked_mut(q) };
+                        if m.1 == u32::MAX { *m = (e.pk, np); np += 1; acc.cnt.push(0); break m.1; }
+                        if m.0 == e.pk { break m.1; }
+                        q = (q + 1) & mask;
+                    };
+                    acc.pidx.push(id);
+                    unsafe { *acc.cnt.get_unchecked_mut(id as usize) += 1; }
+                }
             }
         }
+        acc.np = np;
         cls.clear();
         for (v, off) in &cl_parts { cls.extend_from_slice(&v[off[b] as usize..off[b + 1] as usize]); }
         T_GATHER.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
@@ -1507,7 +1513,7 @@ mod out {
         let mut ud = Vec::with_capacity(n * 14);
         let mut tdv: Vec<u8> = Vec::with_capacity(n * 10);
         let mut present = Vec::with_capacity(n);
-        let (mut day, mut se, mut ev, mut rv) = (Vec::with_capacity(n * 4), Vec::with_capacity(n * 8), Vec::with_capacity(n * 8), Vec::with_capacity(n * 8));
+        let (mut day, mut se, mut ev, mut rv) = (Vec::with_capacity(n * 4), Vec::with_capacity(n * 4), Vec::with_capacity(n * 4), Vec::with_capacity(n * 8));
         let mut ntop = 0usize;
         for (i, r) in rows.iter().enumerate() {
             if let Some(x) = rows.get(i + 16) { prefetch_field(x.name); }
@@ -1515,8 +1521,8 @@ mod out {
             ud.extend_from_slice(&(nm.len() as u32).to_le_bytes());
             ud.extend_from_slice(nm);
             day.extend_from_slice(&r.day.to_le_bytes());
-            se.extend_from_slice(&(r.sessions as i64).to_le_bytes());
-            ev.extend_from_slice(&(r.events as i64).to_le_bytes());
+            se.extend_from_slice(&(r.sessions as i32).to_le_bytes());
+            ev.extend_from_slice(&(r.events as i32).to_le_bytes());
             rv.extend_from_slice(&(r.rev as i64).to_le_bytes());
             if r.top >= 0 {
                 let c = cats[r.top as usize].as_bytes();
@@ -1532,8 +1538,8 @@ mod out {
         let cols = vec![
             Col { name: "user_id", ty: BYTE_ARRAY, optional: false, logical: Logical::Str, data: ud, nvals: n },
             Col { name: "day", ty: INT32, optional: false, logical: Logical::Date, data: day, nvals: n },
-            Col { name: "sessions", ty: INT64, optional: false, logical: Logical::None, data: se, nvals: n },
-            Col { name: "events", ty: INT64, optional: false, logical: Logical::None, data: ev, nvals: n },
+            Col { name: "sessions", ty: INT32, optional: false, logical: Logical::None, data: se, nvals: n },
+            Col { name: "events", ty: INT32, optional: false, logical: Logical::None, data: ev, nvals: n },
             Col { name: "revenue_cents", ty: INT64, optional: false, logical: Logical::None, data: rv, nvals: n },
             Col { name: "top_category", ty: BYTE_ARRAY, optional: true, logical: Logical::Str, data: td, nvals: n },
         ];
