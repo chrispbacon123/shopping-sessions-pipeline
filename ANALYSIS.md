@@ -7,20 +7,32 @@
 ## Timing Results
 
 ### Local (4-CPU VM, 8 threads)
-| Dataset | Cold Cache | Notes |
-|---------|-----------|-------|
-| 20M events | 3.3-3.4s | Matches official ~3.12s baseline |
-| 60M events | 15.7-18s | ~4.7x more data, ~5x more time |
+| Dataset | Cold Cache | Output Rows |
+|---------|-----------|-------------|
+| 20M events (1.79 GiB) | 3.2-3.4s | 2.2M user_daily |
+| 60M events (5.21 GiB) | 16-17s | 6.5M user_daily |
 
-### Breakdown (20M, 8 threads, cold)
+### Breakdown (20M, 8 threads, cold cache)
 | Phase | Time | % Total |
 |-------|------|---------|
 | Small files | ~10ms | 0.3% |
-| Links+events parse | ~1.6s | 48% |
-| Clicks parse | ~0.4s | 12% |
-| Events dedup | ~0.9s | 27% |
+| Links+events parse | ~1.6s | 50% |
+| Clicks parse | ~0.4s | 13% |
+| Events dedup | ~0.8s | 25% |
 | Sessionize | ~0.4s | 12% |
 | Write output | ~0.1s | 3% |
+
+### Breakdown (60M, 8 threads, cold cache)
+| Phase | Time | % Total |
+|-------|------|---------|
+| Small files | ~9ms | 0.1% |
+| Links+events parse | ~4.3s | 26% |
+| Clicks parse | ~1.4s | 8% |
+| Events dedup | ~7.9s | 48% |
+| Sessionize | ~1.8s | 11% |
+| Write output | ~1.1s | 7% |
+
+Note: Dedup dominates at 60M due to larger hash tables and cache misses.
 
 ## Theoretical Floor Analysis
 
