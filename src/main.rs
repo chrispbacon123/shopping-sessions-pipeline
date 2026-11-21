@@ -31,7 +31,23 @@ fn field_at(off: u64) -> S {
     let f = files()[(off >> 40) as usize];
     let p = (off & ((1u64 << 40) - 1)) as usize;
     let r = &f[p..];
+    if r.len() >= 32 {
+        // IDs are short: one 32-byte compare usually finds the terminator
+        unsafe {
+            use core::arch::x86_64::*;
+            let v = _mm256_loadu_si256(r.as_ptr() as *const __m256i);
+            let m = _mm256_or_si256(_mm256_or_si256(_mm256_cmpeq_epi8(v, _mm256_set1_epi8(b',' as i8)), _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8))), _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'"' as i8)));
+            let bits = _mm256_movemask_epi8(m) as u32;
+            if bits != 0 { return r.get_unchecked(..bits.trailing_zeros() as usize); }
+        }
+    }
     match memchr3(b',', b'\n', b'"', r) { Some(e) => &r[..e], None => r }
+}
+#[inline(always)]
+fn prefetch_field(off: u64) {
+    let f = files()[(off >> 40) as usize];
+    let p = (off & ((1u64 << 40) - 1)) as usize;
+    unsafe { core::arch::x86_64::_mm_prefetch(f.as_ptr().add(p) as *const i8, core::arch::x86_64::_MM_HINT_T0); }
 }
 
 #[inline(always)]
@@ -615,7 +631,7 @@ fn build_people(link_fis: &[usize]) -> People {
     }).collect();
     tl("s1");
     let total: usize = pairs.iter().map(|v| v.len()).sum();
-    let cap = (total * 5 / 2 + 16).next_power_of_two();
+    let cap = (total * 2 + 16).next_power_of_two(); // distinct IDs <= 2*pairs, so the table never fills
     let mut ppl = People { slots: zeroed_vec(cap), mask: cap - 1, look: Vec::new() };
     let parent: Vec<AtomicU32> = zeroed_vec(cap); // 0 = root, else parent+1
     if vb { eprintln!("      pairs {} cap {}", total, cap); }
@@ -695,11 +711,11 @@ impl<'a> Ctx<'a> {
 }
 
 struct Acc { camp: Vec<[u64; 4]>, asst: Vec<u32>, evbuf: Vec<Ev>, clbuf: Vec<Cl>, rows: Vec<URow>, catsum: Vec<u64>, starts: Vec<u32>, sdays: Vec<u32>, tmp: Vec<(u16, u32)>,
-    map: Vec<(u64, u32)>, pidx: Vec<u32>, cnt: Vec<u32>, estart: Vec<u32>, cstart: Vec<u32>, cpid: Vec<u32>, evs: Vec<Ev>, cls: Vec<Cl> }
+    map: Vec<(u64, u32)>, pidx: Vec<u32>, cnt: Vec<u32>, estart: Vec<u32>, cstart: Vec<u32>, cpid: Vec<u32>, evs: Vec<Ev>, cls: Vec<Cl>, ord: Vec<u64> }
 impl Acc {
     fn new(c: &Ctx<'_>) -> Self {
         Acc { camp: vec![[0; 4]; (c.ncamp + 1) * c.ndays], asst: vec![0; (c.ncamp + 1) * c.ndays], evbuf: Vec::new(), clbuf: Vec::new(), rows: Vec::new(), catsum: vec![0; c.ncat], starts: Vec::new(), sdays: Vec::new(), tmp: Vec::new(),
-            map: Vec::new(), pidx: Vec::new(), cnt: Vec::new(), estart: Vec::new(), cstart: Vec::new(), cpid: Vec::new(), evs: Vec::new(), cls: Vec::new() }
+            map: Vec::new(), pidx: Vec::new(), cnt: Vec::new(), estart: Vec::new(), cstart: Vec::new(), cpid: Vec::new(), evs: Vec::new(), cls: Vec::new(), ord: Vec::new() }
     }
 }
 
@@ -784,12 +800,16 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
     for pi in 0..npu {
         let (i, i1) = (acc.estart[pi] as usize, acc.estart[pi + 1] as usize);
         let (j, j1) = (acc.cstart[pi] as usize, acc.cstart[pi + 1] as usize);
-        evs[i..i1].sort_unstable_by_key(|e| e.ts);
         if j1 - j > 1 {
             cls[j..j1].sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| if a.cid == b.cid { std::cmp::Ordering::Equal } else { field_at(b.cid).cmp(field_at(a.cid)) }));
         }
         let name = c.resolve_name(evs[i].name, evs[i].rid);
         let pe = &evs[i..i1];
+        // sort (ts, index) u64 keys instead of moving 24-byte records
+        acc.ord.clear();
+        acc.ord.extend(pe.iter().enumerate().map(|(k, e)| ((e.ts as u64) << 32) | k as u64));
+        acc.ord.sort_unstable();
+        let ord = std::mem::take(&mut acc.ord);
         let pc = &cls[j..j1];
         acc.starts.clear();
         acc.sdays.clear();
@@ -824,7 +844,8 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
                 acc.rows.push(URow { name, day: cur_day as i32, sessions: d_sess, events: d_ev, rev: d_rev, top });
             }
         }}}
-        for e in pe {
+        for &ok in ord.iter() {
+            let e = unsafe { pe.get_unchecked((ok & 0xFFFF_FFFF) as usize) };
             if first || e.ts - prev_ts > 1_800_000 {
                 if !first { close_session!(); }
                 first = false;
@@ -854,6 +875,7 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
         }
         close_session!();
         flush_day!();
+        acc.ord = ord;
         if !pc.is_empty() {
             acc.tmp.clear();
             acc.tmp.extend(pc.iter().map(|x| (x.camp, x.ts)));
@@ -886,7 +908,13 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
     acc.cls = cls;
 }
 
+extern "C" { fn mi_option_set(option: i32, value: std::os::raw::c_long); }
+const MI_OPTION_PURGE_DELAY: i32 = 15; // mimalloc v2 mi_option_purge_delay
+
 fn main() {
+    // Never hand freed memory back to the OS mid-run: reused pages skip the kernel's zeroing and
+    // avoid madvise/TLB-shootdown churn (measured ~3-5% wall at 20M).
+    unsafe { mi_option_set(MI_OPTION_PURGE_DELAY, -1); }
     let t0 = Instant::now();
     let verbose = std::env::var("VERBOSE").is_ok();
     let lap = |what: &str| if verbose { eprintln!("{:>8.1} ms  {}", t0.elapsed().as_secs_f64() * 1000.0, what) };
@@ -939,6 +967,16 @@ fn main() {
     let ev_fis: Vec<usize> = (2 + ln_p.len() + cl_p.len()..all.len()).collect();
     lap("mapped");
     if std::env::var("BENCH").is_ok() { bench(&ev_fis); return; }
+    if std::env::var("BENCHCL").is_ok() {
+        let ch = chunks(&cl_fis, 8 << 20); let mut acc = 0u64; let mut nl = 0u64;
+        let t = Instant::now(); for c in &ch { for_records::<4>(c.data(), |f| { acc += f[0].len() as u64; nl += 1; }); }
+        eprintln!("click records {} lines {:.0} ms", nl, t.elapsed().as_secs_f64()*1e3);
+        let t = Instant::now(); for c in &ch { for_records::<4>(c.data(), |f| { acc += parse_ts(f[3]).unwrap_or(0) as u64; }); }
+        eprintln!("click records+ts {:.0} ms", t.elapsed().as_secs_f64()*1e3);
+        let t = Instant::now(); for c in &ch { for_records::<4>(c.data(), |f| { acc += hs(f[1]); }); }
+        eprintln!("click records+hs {:.0} ms {}", t.elapsed().as_secs_f64()*1e3, acc);
+        return;
+    }
 
     let small = |fi: usize| -> Vec<(S, S)> {
         let mut v = Vec::new();
@@ -1126,12 +1164,24 @@ fn main() {
     std::fs::create_dir_all(&ud).unwrap();
     std::fs::create_dir_all(&cd).unwrap();
     let catnames: Vec<&str> = cats.iter().map(|c| std::str::from_utf8(c).unwrap_or("?")).collect();
+    lap("dirs");
     rayon::join(
-        || accs.par_iter().enumerate().for_each(|(k, a)| out::write_user(&ud.join(format!("part-{:05}.parquet", k)), &a.rows, &catnames)),
+        || {
+            // balanced pieces (~1/16 of all rows each, never spanning accs) so no writer thread lags
+            let total: usize = accs.iter().map(|a| a.rows.len()).sum();
+            let target = (total / 16).max(4096);
+            let mut pieces: Vec<&[URow]> = Vec::new();
+            for a in &accs { for p in a.rows.chunks(target) { pieces.push(p); } }
+            if pieces.is_empty() { pieces.push(&[]); }
+            pieces.par_iter().with_max_len(1).enumerate().for_each(|(k, p)| out::write_user(&ud.join(format!("part-{:05}.parquet", k)), p, &catnames));
+            lap("user files");
+        },
         || {
             let mut tot = vec![[0u64; 4]; (ctx.ncamp + 1) * ctx.ndays];
             for a in &accs { for (i, (t, x)) in tot.iter_mut().zip(a.camp.iter()).enumerate() { for q in 0..3 { t[q] += x[q]; } t[3] += a.asst[i] as u64; } }
+            lap("camp summed");
             out::write_campaign(&cd.join("part-00000.parquet"), &tot, &camps, ctx.ndays, ctx.ws_day);
+            lap("camp file");
         },
     );
     lap("written");
@@ -1172,6 +1222,133 @@ fn resolve_clicks(people: &People, raw: &mut [Cl]) {
     people.resolve_all(raw, |c| c.pk, |c, pk, _| c.pk = pk);
 }
 
+/// Minimal hand-written Parquet writer (PLAIN, UNCOMPRESSED, one row group, one data page per column).
+mod pq {
+    // --- Thrift compact protocol (just what FileMetaData/PageHeader need) ---
+    pub struct T { pub b: Vec<u8>, last: Vec<i16> }
+    impl T {
+        pub fn new() -> Self { T { b: Vec::new(), last: vec![0] } }
+        fn varint(&mut self, mut v: u64) { while v >= 0x80 { self.b.push((v as u8) | 0x80); v >>= 7; } self.b.push(v as u8); }
+        fn zz(&mut self, v: i64) { self.varint(((v << 1) ^ (v >> 63)) as u64); }
+        fn fh(&mut self, id: i16, ty: u8) {
+            let l = *self.last.last().unwrap();
+            let d = id - l;
+            if d > 0 && d <= 15 { self.b.push(((d as u8) << 4) | ty); } else { self.b.push(ty); self.zz(id as i64); }
+            *self.last.last_mut().unwrap() = id;
+        }
+        pub fn i32(&mut self, id: i16, v: i32) { self.fh(id, 5); self.zz(v as i64); }
+        pub fn i64(&mut self, id: i16, v: i64) { self.fh(id, 6); self.zz(v); }
+        pub fn bin(&mut self, id: i16, v: &[u8]) { self.fh(id, 8); self.varint(v.len() as u64); self.b.extend_from_slice(v); }
+        pub fn begin(&mut self, id: i16) { self.fh(id, 12); self.last.push(0); }
+        pub fn end(&mut self) { self.b.push(0); self.last.pop(); }
+        pub fn list(&mut self, id: i16, ety: u8, n: usize) {
+            self.fh(id, 9);
+            if n < 15 { self.b.push(((n as u8) << 4) | ety); } else { self.b.push(0xF0 | ety); self.varint(n as u64); }
+        }
+        pub fn le_i32(&mut self, v: i32) { self.zz(v as i64); }
+        pub fn le_str(&mut self, v: &[u8]) { self.varint(v.len() as u64); self.b.extend_from_slice(v); }
+        pub fn sbegin(&mut self) { self.last.push(0); }
+    }
+    pub const INT32: i32 = 1; pub const INT64: i32 = 2; pub const BYTE_ARRAY: i32 = 6;
+    pub enum Logical { None, Str, Date }
+    pub struct Col { pub name: &'static str, pub ty: i32, pub optional: bool, pub logical: Logical, pub data: Vec<u8>, pub nvals: usize }
+
+    /// Writes PAR1 file bytes into `out`.
+    pub fn file(w: &mut impl std::io::Write, cols: &[Col], nrows: usize) -> std::io::Result<()> {
+        w.write_all(b"PAR1")?;
+        let mut pos: usize = 4;
+        let mut metas: Vec<(i64, i64)> = Vec::new(); // (data_page_offset, total size)
+        for c in cols {
+            let off = pos as i64;
+            let mut h = T::new();
+            h.sbegin();
+            h.i32(1, 0); // DATA_PAGE
+            h.i32(2, c.data.len() as i32);
+            h.i32(3, c.data.len() as i32);
+            h.begin(5);
+            h.i32(1, c.nvals as i32);
+            h.i32(2, 0); // PLAIN
+            h.i32(3, 3); // RLE
+            h.i32(4, 3); // RLE
+            h.end();
+            h.b.push(0);
+            w.write_all(&h.b)?;
+            w.write_all(&c.data)?;
+            pos += h.b.len() + c.data.len();
+            metas.push((off, pos as i64 - off));
+        }
+        let mut m = T::new();
+        m.sbegin();
+        m.i32(1, 1);
+        m.list(2, 12, cols.len() + 1);
+        // root
+        m.sbegin(); m.bin(4, b"schema"); m.i32(5, cols.len() as i32); m.b.push(0); m.last.pop();
+        for c in cols {
+            m.sbegin();
+            m.i32(1, c.ty);
+            m.i32(3, if c.optional { 1 } else { 0 });
+            m.bin(4, c.name.as_bytes());
+            match c.logical {
+                Logical::Str => { m.i32(6, 0); m.begin(10); m.begin(1); m.end(); m.end(); }
+                Logical::Date => { m.i32(6, 6); m.begin(10); m.begin(6); m.end(); m.end(); }
+                Logical::None => {}
+            }
+            m.b.push(0); m.last.pop();
+        }
+        m.i64(3, nrows as i64);
+        m.list(4, 12, 1);
+        m.sbegin();
+        m.list(1, 12, cols.len());
+        let mut total = 0i64;
+        for (c, &(off, sz)) in cols.iter().zip(metas.iter()) {
+            total += sz;
+            m.sbegin();
+            m.i64(2, off);
+            m.begin(3);
+            m.i32(1, c.ty);
+            m.list(2, 5, if c.optional { 2 } else { 1 });
+            m.le_i32(0); // PLAIN
+            if c.optional { m.le_i32(3); } // RLE (def levels)
+            m.list(3, 8, 1);
+            m.le_str(c.name.as_bytes());
+            m.i32(4, 0); // UNCOMPRESSED
+            m.i64(5, nrows as i64);
+            m.i64(6, sz);
+            m.i64(7, sz);
+            m.i64(9, off);
+            m.end();
+            m.b.push(0); m.last.pop();
+        }
+        m.i64(2, total);
+        m.i64(3, nrows as i64);
+        m.b.push(0); m.last.pop();
+        m.bin(6, b"shopping_sessions");
+        m.b.push(0);
+        let mut tail = m.b;
+        let ml = tail.len() as u32;
+        tail.extend_from_slice(&ml.to_le_bytes());
+        tail.extend_from_slice(b"PAR1");
+        w.write_all(&tail)
+    }
+    /// v1 page definition levels (bit width 1) as one bit-packed run, with the 4-byte length prefix.
+    pub fn def_levels(present: &[bool]) -> Vec<u8> {
+        let groups = present.len().div_ceil(8);
+        let mut run = Vec::with_capacity(groups + 10);
+        let mut v = ((groups as u64) << 1) | 1;
+        while v >= 0x80 { run.push((v as u8) | 0x80); v >>= 7; }
+        run.push(v as u8);
+        for g in 0..groups {
+            let mut byte = 0u8;
+            for k in 0..8 { let i = g * 8 + k; if i < present.len() && present[i] { byte |= 1 << k; } }
+            run.push(byte);
+        }
+        let mut out = Vec::with_capacity(run.len() + 4);
+        out.extend_from_slice(&(run.len() as u32).to_le_bytes());
+        out.extend_from_slice(&run);
+        out
+    }
+}
+
 mod out {
     use super::*;
     use arrow_array::builder::StringBuilder;
@@ -1195,6 +1372,47 @@ mod out {
     fn s(b: &[u8]) -> &str { unsafe { std::str::from_utf8_unchecked(b) } }
 
     pub fn write_user(path: &Path, rows: &[URow], cats: &[&str]) {
+        use super::pq::*;
+        let n = rows.len();
+        let mut ud = Vec::with_capacity(n * 14);
+        let mut tdv: Vec<u8> = Vec::with_capacity(n * 10);
+        let mut present = Vec::with_capacity(n);
+        let (mut day, mut se, mut ev, mut rv) = (Vec::with_capacity(n * 4), Vec::with_capacity(n * 8), Vec::with_capacity(n * 8), Vec::with_capacity(n * 8));
+        let mut ntop = 0usize;
+        for (i, r) in rows.iter().enumerate() {
+            if let Some(x) = rows.get(i + 16) { prefetch_field(x.name); }
+            let nm = field_at(r.name);
+            ud.extend_from_slice(&(nm.len() as u32).to_le_bytes());
+            ud.extend_from_slice(nm);
+            day.extend_from_slice(&r.day.to_le_bytes());
+            se.extend_from_slice(&(r.sessions as i64).to_le_bytes());
+            ev.extend_from_slice(&(r.events as i64).to_le_bytes());
+            rv.extend_from_slice(&(r.rev as i64).to_le_bytes());
+            if r.top >= 0 {
+                let c = cats[r.top as usize].as_bytes();
+                tdv.extend_from_slice(&(c.len() as u32).to_le_bytes());
+                tdv.extend_from_slice(c);
+                present.push(true);
+                ntop += 1;
+            } else { present.push(false); }
+        }
+        let _ = ntop;
+        let mut td = def_levels(&present);
+        td.extend_from_slice(&tdv);
+        let cols = vec![
+            Col { name: "user_id", ty: BYTE_ARRAY, optional: false, logical: Logical::Str, data: ud, nvals: n },
+            Col { name: "day", ty: INT32, optional: false, logical: Logical::Date, data: day, nvals: n },
+            Col { name: "sessions", ty: INT64, optional: false, logical: Logical::None, data: se, nvals: n },
+            Col { name: "events", ty: INT64, optional: false, logical: Logical::None, data: ev, nvals: n },
+            Col { name: "revenue_cents", ty: INT64, optional: false, logical: Logical::None, data: rv, nvals: n },
+            Col { name: "top_category", ty: BYTE_ARRAY, optional: true, logical: Logical::Str, data: td, nvals: n },
+        ];
+        let mut f = File::create(path).unwrap();
+        file(&mut f, &cols, n).unwrap();
+    }
+
+    #[allow(dead_code)]
+    pub fn write_user_arrow(path: &Path, rows: &[URow], cats: &[&str]) {
         let schema = Arc::new(Schema::new(vec![
             Field::new("user_id", DataType::Utf8, false),
             Field::new("day", DataType::Date32, false),
