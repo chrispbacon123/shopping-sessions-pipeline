@@ -7,8 +7,8 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 use xxhash_rust::xxh3::{xxh3_128, xxh3_64};
 
@@ -215,7 +215,6 @@ fn map_file(p: &Path) -> S {
     let len = f.metadata().unwrap().len();
     if len == 0 { return &[]; }
     let m = unsafe { memmap2::MmapOptions::new().map(&f).unwrap() };
-    let _ = m.advise(memmap2::Advice::WillNeed);
     let m: &'static Mmap = Box::leak(Box::new(m));
     &m[..]
 }
@@ -231,20 +230,26 @@ fn list_csv(dir: &Path) -> Vec<PathBuf> {
 #[derive(Clone, Copy)]
 struct Chunk { fi: usize, start: usize, end: usize }
 impl Chunk {
-    #[inline] fn data(&self) -> S { &files()[self.fi][self.start..self.end] }
+    #[inline] fn data(&self) -> S {
+        let f = files()[self.fi];
+        let n = f.len();
+        let snap = |p: usize| -> usize { match memchr(b'\n', &f[p..]) { Some(i) => p + i + 1, None => n } };
+        // start: first line starting at >= start (the header line starting at 0 is skipped)
+        let s = if self.start == 0 { snap(0) } else { snap(self.start - 1) };
+        let e = if self.end >= n { n } else { snap(self.end - 1) };
+        if s >= e { &f[n..n] } else { &f[s..e] }
+    }
     #[inline] fn off(&self, field: S) -> u64 { ((self.fi as u64) << 40) | (field.as_ptr() as usize - files()[self.fi].as_ptr() as usize) as u64 }
 }
+/// Nominal byte ranges only (no data touched, so no page faults on cold files).
+/// A line belongs to the chunk holding its first byte; data() snaps to line starts and skips the header.
 fn chunks(fis: &[usize], target: usize) -> Vec<Chunk> {
     let mut out = Vec::new();
     for &fi in fis {
-        let f = files()[fi];
-        let body_start = match memchr(b'\n', f) { Some(i) => i + 1, None => continue };
-        let mut s = body_start;
-        while s < f.len() {
-            let mut e = (s + target).min(f.len());
-            if e < f.len() {
-                e = match memchr(b'\n', &f[e..]) { Some(i) => e + i + 1, None => f.len() };
-            }
+        let n = files()[fi].len();
+        let mut s = 0;
+        while s < n {
+            let e = s.saturating_add(target).min(n);
             out.push(Chunk { fi, start: s, end: e });
             s = e;
         }
@@ -320,10 +325,78 @@ fn fix_quotes<const N: usize>(out: &mut [S; N]) -> bool {
     true
 }
 
+/// Streaming parser: every byte is classified once in 64-byte AVX2 blocks; commas/newlines are walked
+/// as bit events. Per line, field i spans [b[i], b[i+1]-1). A field is quoted iff its first and last
+/// bytes are quotes (len >= 2); the line is valid iff its quote count is exactly 2 x quoted fields.
+#[inline(always)]
+fn for_records<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
+    let n = chunk.len();
+    if n == 0 { return; }
+    let base = chunk.as_ptr();
+    let mut bnd = [0u32; N];      // field start offsets (bnd[0] = line start)
+    let mut nf: usize = 1;        // fields seen so far in the current line (bad if > N)
+    let mut lq: u32 = 0;          // quote count before the line start (running)
+    let mut qbase: u32 = 0;       // quote count before this block
+    let mut pad = [0u8; 64];
+    let mut blk = 0usize;
+    let mut out: [S; N] = [&[]; N];
+    macro_rules! emit { ($end:expr, $qend:expr) => {{
+        let end = $end as usize;
+        if nf == N {
+            let mut quoted = 0u32;
+            let mut bad = false;
+            for k in 0..N {
+                let st = bnd[k] as usize;
+                let e = if k + 1 < N { bnd[k + 1] as usize - 1 } else { end };
+                let mut fs = st; let mut fe = e;
+                if e > st {
+                    let a = unsafe { *base.add(st) } == b'"';
+                    let b = unsafe { *base.add(e - 1) } == b'"';
+                    if a | b {
+                        bad |= (a != b) | (e - st < 2);
+                        quoted += 1;
+                        fs = st + 1; fe = if e - st >= 2 { e - 1 } else { st + 1 };
+                    }
+                }
+                out[k] = unsafe { std::slice::from_raw_parts(base.add(fs), fe - fs) };
+            }
+            if !bad && ($qend - lq) == 2 * quoted { f(&out); }
+        }
+    }}}
+    while blk < n {
+        let avail = n - blk;
+        let p = if avail >= 64 { unsafe { base.add(blk) } } else { pad = [0u8; 64]; pad[..avail].copy_from_slice(&chunk[blk..]); pad.as_ptr() };
+        let (mut cm, qm, mut nm) = mask3(p);
+        if avail < 64 { let lm = (1u64 << avail) - 1; cm &= lm; nm &= lm; }
+        let qm = if avail < 64 { qm & ((1u64 << avail) - 1) } else { qm };
+        let mut ev = cm | nm;
+        while ev != 0 {
+            let i = ev.trailing_zeros();
+            let bit = 1u64 << i;
+            let pos = (blk + i as usize) as u32;
+            if nm & bit != 0 {
+                let qend = qbase + (qm & (bit - 1)).count_ones();
+                emit!(pos, qend);
+                bnd[0] = pos + 1;
+                nf = 1;
+                lq = qend;
+            } else {
+                if nf < N { bnd[nf] = pos + 1; }
+                nf += 1;
+            }
+            ev &= ev - 1;
+        }
+        qbase += qm.count_ones();
+        blk += 64;
+    }
+    // final line without trailing newline
+    if (bnd[0] as usize) < n { emit!(n, qbase); }
+}
+
 /// Parses every line of a chunk into exactly N fields (rules.md dialect), calling f for each well-formed line.
 /// `safe_end`: bytes of the underlying file available after chunk end (for 64-byte over-reads).
 #[inline(always)]
-fn for_records<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
+fn for_records_old<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
     let mut out: [S; N] = [&[]; N];
     let n = chunk.len();
     let mut s = 0usize;
@@ -448,8 +521,16 @@ fn zeroed_vec<T>(n: usize) -> Vec<T> {
     // T must be valid when all-zero (atomics of ints)
     unsafe {
         let layout = std::alloc::Layout::array::<T>(n.max(1)).unwrap();
-        let p = std::alloc::alloc_zeroed(layout) as *mut T;
-        Vec::from_raw_parts(p, n, n.max(1))
+        // Write-touch in parallel: a read-before-write on calloc'd memory maps the shared zero page and the
+        // later write then does a COW copy plus a TLB-shootdown IPI to every CPU (measured ~5% of runtime).
+        let p = std::alloc::alloc(layout) as *mut u8;
+        let bytes = layout.size();
+        let pa = p as usize;
+        (0..bytes.div_ceil(1 << 20)).into_par_iter().for_each(|k| {
+            let o = k << 20;
+            std::ptr::write_bytes((pa + o) as *mut u8, 0, (1usize << 20).min(bytes - o));
+        });
+        Vec::from_raw_parts(p as *mut T, n, n.max(1))
     }
 }
 
@@ -521,6 +602,7 @@ impl People {
 }
 
 fn build_people(link_fis: &[usize]) -> People {
+    let tq = Instant::now(); let vb = std::env::var_os("VERBOSE").is_some(); let tl = |w: &str| if vb { eprintln!("      people.{} {:.1} ms", w, tq.elapsed().as_secs_f64()*1e3) };
     let ch = chunks(link_fis, 1 << 20);
     let pairs: Vec<Vec<(u64, u64, u64, u64)>> = ch.par_iter().map(|c| {
         let d = c.data();
@@ -531,10 +613,13 @@ fn build_people(link_fis: &[usize]) -> People {
         });
         v
     }).collect();
+    tl("s1");
     let total: usize = pairs.iter().map(|v| v.len()).sum();
     let cap = (total * 5 / 2 + 16).next_power_of_two();
     let mut ppl = People { slots: zeroed_vec(cap), mask: cap - 1, look: Vec::new() };
     let parent: Vec<AtomicU32> = zeroed_vec(cap); // 0 = root, else parent+1
+    if vb { eprintln!("      pairs {} cap {}", total, cap); }
+    tl("alloc");
     let find = |mut x: u32| -> u32 {
         loop {
             let p = parent[x as usize].load(Relaxed);
@@ -546,7 +631,11 @@ fn build_people(link_fis: &[usize]) -> People {
         }
     };
     pairs.par_iter().for_each(|v| {
-        for &(ha, oa, hb, ob) in v {
+        const D: usize = 12;
+        let pf = |h: u64| unsafe { core::arch::x86_64::_mm_prefetch(ppl.slots.as_ptr().add(h as usize & ppl.mask) as *const i8, core::arch::x86_64::_MM_HINT_T0) };
+        for x in v.iter().take(D) { pf(x.0); pf(x.2); }
+        for (idx, &(ha, oa, hb, ob)) in v.iter().enumerate() {
+            if let Some(x) = v.get(idx + D) { pf(x.0); pf(x.2); }
             let mut a = ppl.insert(ha, oa);
             let mut b = ppl.insert(hb, ob);
             loop {
@@ -559,6 +648,7 @@ fn build_people(link_fis: &[usize]) -> People {
             }
         }
     });
+    tl("s2");
     // smallest name per root: use root slot's pk field as best (off+1)
     let used = |i: usize| ppl.slots[i].key.load(Relaxed) != 0;
     (0..cap).into_par_iter().with_min_len(4096).for_each(|i| {
@@ -572,6 +662,7 @@ fn build_people(link_fis: &[usize]) -> People {
             match best.compare_exchange(cur, my + 1, Relaxed, Relaxed) { Ok(_) => break, Err(c) => cur = c }
         }
     });
+    tl("s3");
     (0..cap).into_par_iter().with_min_len(4096).for_each(|i| {
         if !used(i) || parent[i].load(Relaxed) != 0 { return; }
         let s = &ppl.slots[i];
@@ -579,6 +670,7 @@ fn build_people(link_fis: &[usize]) -> People {
         s.off.store(off, Relaxed);
         s.pk.store(hs(field_at(off)), Relaxed);
     });
+    tl("s4");
     (0..cap).into_par_iter().with_min_len(4096).for_each(|i| {
         if !used(i) || parent[i].load(Relaxed) == 0 { return; }
         let r = find(i as u32) as usize;
@@ -586,7 +678,9 @@ fn build_people(link_fis: &[usize]) -> People {
         s.off.store(ppl.slots[r].off.load(Relaxed), Relaxed);
         s.pk.store(ppl.slots[r].pk.load(Relaxed), Relaxed);
     });
+    tl("s5");
     let look: Vec<(u64, u64)> = ppl.slots.par_iter().map(|sl| (sl.key.load(Relaxed), sl.pk.load(Relaxed))).collect();
+    tl("s6");
     ppl.look = look;
     ppl
 }
@@ -827,6 +921,19 @@ fn main() {
     all.extend(ev_p.iter().cloned());
     let mapped: Vec<S> = all.par_iter().map(|p| map_file(p)).collect();
     FILES.set(mapped).ok();
+    // Background readahead in consumption order (small files, links, clicks, events): keeps the
+    // disk queue full on a cold page cache while the main pipeline only ever waits on the head.
+    std::thread::spawn(|| {
+        let piece = 8usize << 20;
+        for f in files() {
+            let mut o = 0;
+            while o < f.len() {
+                let k = piece.min(f.len() - o);
+                unsafe { libc::madvise(f.as_ptr().add(o) as *mut libc::c_void, k, libc::MADV_WILLNEED); }
+                o += k;
+            }
+        }
+    });
     let ln_fis: Vec<usize> = (2..2 + ln_p.len()).collect();
     let cl_fis: Vec<usize> = (2 + ln_p.len()..2 + ln_p.len() + cl_p.len()).collect();
     let ev_fis: Vec<usize> = (2 + ln_p.len() + cl_p.len()..all.len()).collect();
@@ -863,11 +970,9 @@ fn main() {
     let lbits = 32 - cbits;
     let lmask: u32 = (1u32 << lbits) - 1;
     struct EvPart { keys: (Vec<KeyRec>, Vec<u32>), evs: (Vec<Ev>, Vec<u32>), n: u32 }
-    let (mut ev_parts, cl_parts): (Vec<EvPart>, Vec<(Vec<Cl>, Vec<u32>)>) = rayon::join(
-        || {
-            ech.par_iter().enumerate().map_init(
-                || (Vec::<KeyRec>::new(), Vec::<Ev>::new(), Vec::<u16>::new()),
-                |(kb, eb, kbk), (ci, c)| {
+    let cws = ws - WEEK;
+    let cch = chunks(&cl_fis, 4 << 20);
+    let ev_job = |kb: &mut Vec<KeyRec>, eb: &mut Vec<Ev>, kbk: &mut Vec<u16>, ci: usize, c: &Chunk| -> EvPart {
                 let d = c.data();
                 kb.clear(); eb.clear(); kbk.clear();
                 kb.reserve(d.len() / 40); eb.reserve(d.len() / 40); kbk.reserve(d.len() / 40);
@@ -900,18 +1005,14 @@ fn main() {
                     }
                     if ing_ms - ts > DAY { return; }
                     let uh = hs(uid);
-                    let noff = (uid.as_ptr() as usize - d.as_ptr() as usize + (c.start - cbase)) as u32;
+                    let noff = (uid.as_ptr() as usize - files()[c.fi].as_ptr() as usize - cbase) as u32;
                     eb.push(Ev { pk: uh, ts: (ts - base) as u32, rid, pc: price | ((cat as u32) << 24), name: noff });
                 });
                 assert!(local <= lmask, "chunk too large");
                 people.resolve_all(eb, |e| e.pk, |e, pk, i| { e.pk = pk; e.name = (1u32 << 31) | i; });
                 EvPart { keys: scatter_b(kb, kbk), evs: scatter(eb, |e| bucket(e.pk)), n: local }
-            }).collect::<Vec<_>>()
-        },
-        || {
-            let ch = chunks(&cl_fis, 4 << 20);
-            let cws = ws - WEEK;
-            ch.par_iter().map(|c| {
+    };
+    let cl_job = |c: &Chunk| -> (Vec<Cl>, Vec<u32>) {
                 let d = c.data();
                 let mut raw: Vec<Cl> = Vec::with_capacity(d.len() / 45);
                 for_records::<4>(d, |f| {
@@ -922,9 +1023,28 @@ fn main() {
                 });
                 resolve_clicks(&people, &mut raw);
                 scatter(&raw, |r| bucket(r.pk))
-            }).collect()
-        },
-    );
+    };
+    // Work queue in file order (clicks, then events) so consumption follows the prefetcher's read order.
+    let ncl = cch.len();
+    let njobs = ncl + ech.len();
+    let next = AtomicUsize::new(0);
+    let ev_slots: Vec<Mutex<Option<EvPart>>> = (0..ech.len()).map(|_| Mutex::new(None)).collect();
+    let cl_slots: Vec<Mutex<Option<(Vec<Cl>, Vec<u32>)>>> = (0..ncl).map(|_| Mutex::new(None)).collect();
+    rayon::scope(|sc| {
+        for _ in 0..rayon::current_num_threads() {
+            sc.spawn(|_| {
+                let (mut kb, mut eb, mut kbk) = (Vec::<KeyRec>::new(), Vec::<Ev>::new(), Vec::<u16>::new());
+                loop {
+                    let j = next.fetch_add(1, Relaxed);
+                    if j >= njobs { break; }
+                    if j < ncl { *cl_slots[j].lock().unwrap() = Some(cl_job(&cch[j])); }
+                    else { let ci = j - ncl; *ev_slots[ci].lock().unwrap() = Some(ev_job(&mut kb, &mut eb, &mut kbk, ci, &ech[ci])); }
+                }
+            });
+        }
+    });
+    let mut ev_parts: Vec<EvPart> = ev_slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
+    let cl_parts: Vec<(Vec<Cl>, Vec<u32>)> = cl_slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
     lap("events + clicks parsed");
 
     // Phase 3: dedup on event_id -> loser bitmap
@@ -1015,7 +1135,7 @@ fn main() {
         },
     );
     lap("written");
-    if verbose { let st = std::fs::read_to_string("/proc/self/stat").unwrap_or_default(); let f: Vec<&str> = st.rsplit(") ").next().unwrap_or("").split(' ').collect(); eprintln!("  minflt {} majflt {} utime {} stime {}", f[7], f[9], f[11], f[12]); }
+    if verbose { let st = std::fs::read_to_string("/proc/self/stat").unwrap_or_default(); let f: Vec<&str> = st.rsplit(") ").next().unwrap_or("").split(' ').collect(); eprintln!("  minflt {} majflt {} utime {} stime {}", f[7], f[9], f[11], f[12]); let ss = std::fs::read_to_string("/proc/self/status").unwrap_or_default(); for l in ss.lines() { if l.starts_with("VmHWM") || l.starts_with("RssAnon") || l.starts_with("RssFile") { eprintln!("  {}", l); } } }
     // Skip destructors / munmap of multi-GB buffers: all files are closed above.
     std::process::exit(0);
 }
@@ -1036,6 +1156,9 @@ fn bench(ev_fis: &[usize]) {
     let t = Instant::now();
     for c in &ch { for_records::<7>(c.data(), |f| acc += f[0].len() as u64); }
     eprintln!("records {:.0} ms", t.elapsed().as_secs_f64()*1e3);
+    let t = Instant::now();
+    for c in &ch { for_records_old::<7>(c.data(), |f| acc += f[0].len() as u64); }
+    eprintln!("records_old {:.0} ms", t.elapsed().as_secs_f64()*1e3);
     let t = Instant::now();
     for c in &ch { for_records::<7>(c.data(), |f| { acc += parse_ts(f[2]).unwrap_or(0) as u64 + parse_ts(f[3]).unwrap_or(0) as u64; }); }
     eprintln!("records+ts {:.0} ms", t.elapsed().as_secs_f64()*1e3);
