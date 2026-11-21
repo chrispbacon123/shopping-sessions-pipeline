@@ -91,15 +91,26 @@ fn is_leap(y: i64) -> bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
 fn parse_ts(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if n == 0 { return None; }
-    if b.iter().all(|c| c.is_ascii_digit()) {
-        let mut i = 0;
-        while i < n && b[i] == b'0' { i += 1; }
-        let r = &b[i..];
-        if r.len() > 18 { return Some(i64::MAX); }
-        let mut v: i64 = 0;
-        for &c in r { v = v * 10 + (c - b'0') as i64; }
-        return Some(v);
+    
+    // Fast path: check first char for digit (most timestamps are F3 or start with digit)
+    let c0 = b[0];
+    if c0 >= b'0' && c0 <= b'9' {
+        // Check if all digits in one pass
+        let mut all_digits = true;
+        for &c in b { 
+            if c < b'0' || c > b'9' { all_digits = false; break; } 
+        }
+        if all_digits {
+            let mut i = 0;
+            while i < n && b[i] == b'0' { i += 1; }
+            let r = &b[i..];
+            if r.len() > 18 { return Some(i64::MAX); }
+            let mut v: i64 = 0;
+            for &c in r { v = v * 10 + (c - b'0') as i64; }
+            return Some(v);
+        }
     }
+    
     if n != 20 && n != 25 { return None; }
     if b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' { return None; }
     let y = d2(b, 0)? * 100 + d2(b, 2)?;
@@ -127,7 +138,8 @@ fn parse_ts(b: &[u8]) -> Option<i64> {
 
 #[inline]
 fn parse_price(b: &[u8]) -> Option<u32> {
-    if b.is_empty() || !b.iter().all(|c| c.is_ascii_digit()) { return None; }
+    if b.is_empty() { return None; }
+    for &c in b { if c < b'0' || c > b'9' { return None; } }
     let mut i = 0;
     while i < b.len() && b[i] == b'0' { i += 1; }
     let r = &b[i..];
@@ -145,11 +157,13 @@ struct Lookup {
 }
 impl Lookup {
     fn new(prefix: &'static [u8]) -> Self { Lookup { prefix, dense: Vec::new(), other: HashMap::new() } }
+    #[inline]
     fn canon(&self, b: &[u8]) -> Option<usize> {
         let p = self.prefix.len();
         if b.len() <= p || b.len() > p + 7 || &b[..p] != self.prefix { return None; }
         let r = &b[p..];
-        if r[0] == b'0' || !r.iter().all(|c| c.is_ascii_digit()) { return None; }
+        if r[0] == b'0' { return None; }
+        for &c in r { if c < b'0' || c > b'9' { return None; } }
         let mut v = 0usize;
         for &c in r { v = v * 10 + (c - b'0') as usize; }
         Some(v)
@@ -663,6 +677,12 @@ mod out {
             Field::new("revenue_cents", DataType::Int64, false),
             Field::new("top_category", DataType::Utf8, true),
         ]));
+        if rows.is_empty() {
+            let f = File::create(path).unwrap();
+            let mut w = ArrowWriter::try_new(f, schema, Some(props())).unwrap();
+            w.close().unwrap();
+            return;
+        }
         let bytes: usize = rows.iter().map(|r| r.name.len()).sum();
         let mut ub = StringBuilder::with_capacity(rows.len(), bytes);
         let mut tb = StringBuilder::with_capacity(rows.len(), rows.len() * 8);
