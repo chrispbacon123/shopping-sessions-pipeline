@@ -10,6 +10,9 @@ use std::sync::Arc;
 use std::time::Instant;
 use xxhash_rust::xxh3::xxh3_64;
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
 const NB: usize = 512;

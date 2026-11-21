@@ -4,7 +4,7 @@ RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-ENV RUSTFLAGS="-C target-cpu=x86-64-v3 -C link-self-contained=yes" CARGO_NET_RETRY=5
+ENV RUSTFLAGS="-C target-cpu=cascadelake -C link-self-contained=yes" CARGO_NET_RETRY=5
 RUN cargo build --release --locked && strip target/release/shopping_sessions
 
 FROM scratch
