@@ -1,2 +1,5 @@
 target/
 *.log
+testdata/
+testoutput/
+buildathon/

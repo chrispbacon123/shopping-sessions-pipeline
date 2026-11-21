@@ -296,8 +296,33 @@ fn mask2(p: *const u8) -> (u64, u64) {
     }
 }
 
+// Runtime-detected AVX-512 support (cached at startup)
+static HAS_AVX512: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn init_avx512() {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx512bw") {
+        HAS_AVX512.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 #[inline(always)]
-fn mask3(p: *const u8) -> (u64, u64, u64) {
+fn has_avx512() -> bool { HAS_AVX512.load(std::sync::atomic::Ordering::Relaxed) }
+
+/// 64-byte mask for ',', '"', '\n' - AVX-512 version (returns comma, quote, newline)
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512bw")]
+#[inline]
+unsafe fn mask3_avx512(p: *const u8) -> (u64, u64, u64) {
+    use core::arch::x86_64::*;
+    let v = _mm512_loadu_si512(p as *const __m512i);
+    let cm = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b',' as i8));
+    let qt = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'"' as i8));
+    let nl = _mm512_cmpeq_epi8_mask(v, _mm512_set1_epi8(b'\n' as i8));
+    (cm, qt, nl)
+}
+
+/// 64-byte mask for ',', '"', '\n' - AVX2 fallback (returns comma, quote, newline)
+#[inline(always)]
+fn mask3_avx2(p: *const u8) -> (u64, u64, u64) {
     unsafe {
         use core::arch::x86_64::*;
         let a = _mm256_loadu_si256(p as *const __m256i);
@@ -307,6 +332,15 @@ fn mask3(p: *const u8) -> (u64, u64, u64) {
          (m(a, b'"' as i8) as u64) | ((m(b, b'"' as i8) as u64) << 32),
          (m(a, b'\n' as i8) as u64) | ((m(b, b'\n' as i8) as u64) << 32))
     }
+}
+
+#[inline(always)]
+fn mask3(p: *const u8) -> (u64, u64, u64) {
+    #[cfg(target_arch = "x86_64")]
+    if has_avx512() {
+        return unsafe { mask3_avx512(p) };
+    }
+    mask3_avx2(p)
 }
 
 #[inline(always)]
@@ -887,6 +921,7 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
 }
 
 fn main() {
+    init_avx512();
     let t0 = Instant::now();
     let verbose = std::env::var("VERBOSE").is_ok();
     let lap = |what: &str| if verbose { eprintln!("{:>8.1} ms  {}", t0.elapsed().as_secs_f64() * 1000.0, what) };
