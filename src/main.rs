@@ -177,6 +177,122 @@ fn parse_f1_fast(b: &[u8]) -> Option<i64> {
     Some((civil_days(y, mo, d) * 86400 + hh * 3600 + mi * 60 + ss) * 1000)
 }
 
+// ---------- window-specialized timestamp fast path (exactly equivalent to parse_ts; falls back when unsure) ----------
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+/// Up to 8 "YYYY-MM-" prefixes around the window, each with day number of the 1st and days in month.
+struct DateTab { pre: [u64; 8], first: [i64; 8], dim: [i64; 8], n: usize }
+impl DateTab {
+    fn new(lo_day: i64, hi_day: i64) -> Self {
+        let mut t = DateTab { pre: [u64::MAX; 8], first: [0; 8], dim: [0; 8], n: 0 };
+        let mut d = lo_day;
+        while d <= hi_day && t.n < 8 {
+            let (y, m, _) = civil_from_days(d);
+            if (1000..=9999).contains(&y) {
+                let st = format!("{:04}-{:02}-", y, m);
+                let pre = u64::from_le_bytes(st.as_bytes()[..8].try_into().unwrap());
+                if !t.pre[..t.n].contains(&pre) {
+                    let dim = match m { 1 | 3 | 5 | 7 | 8 | 10 | 12 => 31, 4 | 6 | 9 | 11 => 30, _ => if is_leap(y) { 29 } else { 28 } };
+                    t.pre[t.n] = pre; t.first[t.n] = days_from_civil(y, m, 1); t.dim[t.n] = dim; t.n += 1;
+                }
+            }
+            d += 1;
+        }
+        t
+    }
+}
+#[inline(always)]
+fn ld8(b: &[u8], i: usize) -> u64 { u64::from_le_bytes(b[i..i + 8].try_into().unwrap()) }
+/// 8 ASCII digits (first byte most significant) -> value, or None if any byte is not 0-9.
+#[inline(always)]
+fn swar8(x: u64) -> Option<u64> {
+    let y = x.wrapping_sub(0x3030303030303030);
+    if ((y | y.wrapping_add(0x7676767676767676)) & 0x8080808080808080) != 0 { return None; }
+    let y = (y.wrapping_mul(10) + (y >> 8)) & 0x00FF00FF00FF00FF;
+    let y = (y.wrapping_mul(100) + (y >> 16)) & 0x0000FFFF0000FFFF;
+    Some((y.wrapping_mul(10000) + (y >> 32)) & 0xFFFFFFFF)
+}
+#[inline(always)]
+fn parse_ts_fast(b: &[u8], t: &DateTab) -> Option<i64> {
+    let n = b.len();
+    if n == 13 {
+        if let (Some(hi), Some(lo)) = (swar8(ld8(b, 0)), swar8(ld8(b, 5))) {
+            return Some((hi * 100000 + lo % 100000) as i64);
+        }
+        return parse_ts(b);
+    }
+    if n == 20 || n == 25 {
+        let pre = ld8(b, 0);
+        let mut k = usize::MAX;
+        for i in 0..t.n { if t.pre[i] == pre { k = i; } }
+        if k == usize::MAX || b[10] != b'T' { return parse_ts(b); }
+        let d1 = b[8].wrapping_sub(b'0') as i64; let d0 = b[9].wrapping_sub(b'0') as i64;
+        if d1 > 9 || d0 > 9 { return parse_ts(b); }
+        let dd = d1 * 10 + d0;
+        let x = ld8(b, 11); // HH:MM:SS
+        if x & 0x0000FF0000FF0000 != 0x00003A00003A0000 { return parse_ts(b); }
+        let y = x.wrapping_sub(0x3030303030303030);
+        if ((y | y.wrapping_add(0x7676767676767676)) & 0x8080_0080_8000_8080) != 0 { return parse_ts(b); }
+        let by = |i: u32| ((y >> (8 * i)) & 0xFF) as i64;
+        let (hh, mi, ss) = (by(0) * 10 + by(1), by(3) * 10 + by(4), by(6) * 10 + by(7));
+        if dd < 1 || dd > t.dim[k] || hh > 23 || mi > 59 || ss > 59 { return parse_ts(b); }
+        let mut secs = (t.first[k] + dd - 1) * 86400 + hh * 3600 + mi * 60 + ss;
+        if n == 20 {
+            if b[19] != b'Z' { return parse_ts(b); }
+        } else {
+            let sign = match b[19] { b'+' => 1, b'-' => -1, _ => return parse_ts(b) };
+            if b[22] != b':' { return parse_ts(b); }
+            let g = |i: usize| b[i].wrapping_sub(b'0') as i64;
+            let (a1, a0, c1, c0) = (g(20), g(21), g(23), g(24));
+            if a1 > 9 || a0 > 9 || c1 > 9 || c0 > 9 { return parse_ts(b); }
+            let (oh, om) = (a1 * 10 + a0, c1 * 10 + c0);
+            if oh > 23 || om > 59 { return parse_ts(b); }
+            secs -= sign * (oh * 3600 + om * 60);
+        }
+        return Some(secs * 1000);
+    }
+    parse_ts(b)
+}
+
+fn fuzz_ts(ws: i64, we: i64) {
+    let t = DateTab::new(ws.div_euclid(DAY) - 12, (we - 1).div_euclid(DAY) + 12);
+    let mut st: u64 = 0x9E3779B97F4A7C15;
+    let mut rnd = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
+    let alphabet = b"0123456789-+:TZtz .e\"/";
+    let (mut n, mut fast_hits) = (0u64, 0u64);
+    for _ in 0..20_000_000u64 {
+        let ms = ws - 12 * DAY + (rnd() % (40 * DAY as u64)) as i64;
+        let secs = ms.div_euclid(1000);
+        let (y, m, d) = civil_from_days(secs.div_euclid(86400));
+        let sod = secs.rem_euclid(86400);
+        let kind = rnd() % 3;
+        let mut v: Vec<u8> = match kind {
+            0 => format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, sod / 3600, sod / 60 % 60, sod % 60).into_bytes(),
+            1 => { let off = (rnd() % 1500) as i64 - 600; let l = secs + off * 60; let (y2, m2, d2) = civil_from_days(l.div_euclid(86400)); let s2 = l.rem_euclid(86400);
+                   format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}", y2, m2, d2, s2 / 3600, s2 / 60 % 60, s2 % 60, if off < 0 { '+' } else { '-' }, off.abs() / 60, off.abs() % 60).into_bytes() }
+            _ => format!("{}", ms).into_bytes(),
+        };
+        // mutate some
+        let r = rnd() % 4;
+        if r >= 1 { let nm = 1 + rnd() % 2; for _ in 0..nm { let i = (rnd() as usize) % v.len(); let c = rnd() % 3; if c == 0 { v[i] = alphabet[(rnd() as usize) % alphabet.len()]; } else if c == 1 { v[i] = b'0' + (rnd() % 10) as u8; } else { v[i] = (rnd() & 0xFF) as u8; } } }
+        if r == 3 && rnd() % 4 == 0 { v.truncate((rnd() as usize) % (v.len() + 1)); }
+        let a = parse_ts(&v); let b = parse_ts_fast(&v, &t);
+        if a != b { eprintln!("MISMATCH {:?} slow {:?} fast {:?}", String::from_utf8_lossy(&v), a, b); std::process::exit(1); }
+        n += 1; if a.is_some() { fast_hits += 1; }
+    }
+    eprintln!("fuzz ok: {} cases, {} valid", n, fast_hits);
+}
+
 #[inline]
 fn parse_price(b: &[u8]) -> Option<u32> {
     if b.is_empty() || !b.iter().all(|c| c.is_ascii_digit()) { return None; }
@@ -938,6 +1054,10 @@ fn main() {
     let ws_day = ws.div_euclid(DAY);
     let ndays = ((we - 1).div_euclid(DAY) - ws_day + 1).max(1) as usize;
     let base = ws - WEEK;
+    if std::env::var_os("FUZZTS").is_some() { fuzz_ts(ws, we); return; }
+    let fast_ts = std::env::var_os("NO_FASTTS").is_none();
+    let dtab_v = DateTab::new(ws_day - 12, (we - 1).div_euclid(DAY) + 12);
+    let dtab = &dtab_v;
 
     // map every file in parallel
     let ev_p = list_csv(&data.join("events"));
@@ -1021,7 +1141,7 @@ fn main() {
                 for_records::<7>(d, |f| {
                     let eid = f[0];
                     if eid.is_empty() { return; }
-                    let ing_ms = parse_f1_fast(f[3]).unwrap_or_else(|| parse_ts(f[3]).unwrap_or(i64::MAX));
+                    let ing_ms = if fast_ts { parse_ts_fast(f[3], dtab).unwrap_or(i64::MAX) } else { parse_f1_fast(f[3]).unwrap_or_else(|| parse_ts(f[3]).unwrap_or(i64::MAX)) };
                     let ingest = if ing_ms == i64::MAX { u32::MAX } else { (ing_ms / 1000 - ibase).clamp(0, u32::MAX as i64) as u32 };
                     let h = xxh3_128(eid);
                     let rid = cid | local;
@@ -1030,7 +1150,7 @@ fn main() {
                     kbk.push(bucket((h >> 64) as u64) as u16);
                     let uid = f[1];
                     if uid.is_empty() || f[5].is_empty() { return; }
-                    let ts = match parse_ts(f[2]) { Some(t) if t >= ws && t < we => t, _ => return };
+                    let ts = match if fast_ts { parse_ts_fast(f[2], dtab) } else { parse_ts(f[2]) } { Some(t) if t >= ws && t < we => t, _ => return };
                     let mut price = 0u32;
                     let mut cat = 0u16;
                     match f[4] {
@@ -1055,7 +1175,7 @@ fn main() {
                 let mut raw: Vec<Cl> = Vec::with_capacity(d.len() / 45);
                 for_records::<4>(d, |f| {
                     if f[0].is_empty() || f[1].is_empty() { return; }
-                    let ts = match parse_ts(f[3]) { Some(t) if t >= cws && t < we => t, _ => return };
+                    let ts = match if fast_ts { parse_ts_fast(f[3], dtab) } else { parse_ts(f[3]) } { Some(t) if t >= cws && t < we => t, _ => return };
                     let camp = match clook.get(f[2]) { Some(c) => c, None => return };
                     raw.push(Cl { pk: hs(f[1]), cid: c.off(f[0]), ts: (ts - base) as u32, camp });
                 });
@@ -1185,6 +1305,16 @@ fn main() {
         },
     );
     lap("written");
+    if std::env::var_os("NO_DONTNEED").is_none() {
+        // Drop the input files' page-table entries in parallel (madvise takes mmap_lock shared) so the
+        // single-threaded exit_mmap has little left to zap. Nothing reads the maps after this point.
+        files().par_iter().for_each(|f| {
+            if f.is_empty() { return; }
+            let mut p = f.as_ptr() as usize & !4095; let end = f.as_ptr() as usize + f.len();
+            while p < end { let n = (end - p).min(64 << 20); unsafe { libc::madvise(p as *mut libc::c_void, n, libc::MADV_DONTNEED); } p += n; }
+        });
+        lap("dontneed");
+    }
     if verbose { let st = std::fs::read_to_string("/proc/self/stat").unwrap_or_default(); let f: Vec<&str> = st.rsplit(") ").next().unwrap_or("").split(' ').collect(); eprintln!("  minflt {} majflt {} utime {} stime {}", f[7], f[9], f[11], f[12]); let ss = std::fs::read_to_string("/proc/self/status").unwrap_or_default(); for l in ss.lines() { if l.starts_with("VmHWM") || l.starts_with("RssAnon") || l.starts_with("RssFile") { eprintln!("  {}", l); } } }
     // Skip destructors / munmap of multi-GB buffers: all files are closed above.
     std::process::exit(0);
