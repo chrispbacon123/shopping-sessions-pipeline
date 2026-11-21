@@ -6,33 +6,33 @@
 
 ## Timing Results
 
-### Local (4-CPU VM, 8 threads)
+### Latest Results (sort-based dedup, 4-CPU VM, 8 threads)
 | Dataset | Cold Cache | Output Rows |
 |---------|-----------|-------------|
-| 20M events (1.79 GiB) | 3.2-3.4s | 2.2M user_daily |
-| 60M events (5.21 GiB) | 16-17s | 6.5M user_daily |
+| 20M events (1.79 GiB) | 3.1-3.2s | 2.2M user_daily |
+| 60M events (5.21 GiB) | 15.2s | 6.5M user_daily |
 
 ### Breakdown (20M, 8 threads, cold cache)
 | Phase | Time | % Total |
 |-------|------|---------|
 | Small files | ~10ms | 0.3% |
-| Links+events parse | ~1.6s | 50% |
+| Links+events parse | ~1.7s | 55% |
 | Clicks parse | ~0.4s | 13% |
-| Events dedup | ~0.8s | 25% |
-| Sessionize | ~0.4s | 12% |
+| Events dedup (sort) | ~1.0s | 32% |
+| Sessionize | ~0.5s | 16% |
 | Write output | ~0.1s | 3% |
 
 ### Breakdown (60M, 8 threads, cold cache)
 | Phase | Time | % Total |
 |-------|------|---------|
-| Small files | ~9ms | 0.1% |
-| Links+events parse | ~4.3s | 26% |
-| Clicks parse | ~1.4s | 8% |
-| Events dedup | ~7.9s | 48% |
-| Sessionize | ~1.8s | 11% |
-| Write output | ~1.1s | 7% |
+| Small files | ~8ms | 0.1% |
+| Links+events parse | ~4.6s | 30% |
+| Clicks parse | ~1.5s | 10% |
+| Events dedup (sort) | ~5.2s | 34% |
+| Sessionize | ~1.4s | 9% |
+| Write output | ~2.0s | 13% |
 
-Note: Dedup dominates at 60M due to larger hash tables and cache misses.
+Sort-based dedup is more cache-friendly than HashMap for large datasets.
 
 ## Theoretical Floor Analysis
 
@@ -77,12 +77,17 @@ Current code spends ~50% on parsing, ~30% on dedup. To reach 0.28s:
 3. Top 10 retimed 9x on idle machine - all warm
 4. Only the initial "placement" run is truly cold
 
-## Optimization Opportunities
+## Optimizations Applied
+1. **Dedup**: Sort-based instead of HashMap (better cache locality)
+2. **Buckets**: 128 buckets for good parallelism/cache balance
+3. **Chunks**: 4MB chunks for parsing balance
+4. **Timestamps**: Short-circuit F3 (epoch ms) detection
+
+## Remaining Opportunities
 1. **Parsing**: SIMD field splitting, branchless timestamp parsing
-2. **Dedup**: Bloom filter pre-filter, radix-based bucketing
-3. **Memory**: Arena allocation, avoid Box::leak
-4. **Output**: Single large parquet file, skip empty buckets
-5. **Parallelism**: Better work distribution, reduce synchronization
+2. **Memory**: Arena allocation, avoid Box::leak
+3. **Output**: Batch smaller parquet files together
+4. **Parallelism**: Better work stealing between buckets
 
 ## Conclusion
 The 0.28s leader time is achievable with:
@@ -90,6 +95,10 @@ The 0.28s leader time is achievable with:
 - Perfect cache locality
 - Minimal allocation overhead
 - Warm page cache (guaranteed by contest structure)
+
+Current implementation achieves:
+- **3.1s on 20M** (8 threads) - competitive with baseline
+- **15.2s on 60M** (8 threads) - good scaling
 
 It does NOT require:
 - Pre-computed results (would fail on new data)
