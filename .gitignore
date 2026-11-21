@@ -1,2 +1,7 @@
 target/
 *.log
+testout/
+buildathon/
+*.py
+src/main_orig.rs
+src/main_v2.rs

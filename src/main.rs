@@ -12,8 +12,8 @@ use xxhash_rust::xxh3::xxh3_64;
 
 const DAY: i64 = 86_400_000;
 const WEEK: i64 = 7 * DAY;
-const NB: usize = 512;
-const NBSHIFT: u32 = 64 - 9;
+const NB: usize = 128;
+const NBSHIFT: u32 = 64 - 7;
 type S = &'static [u8];
 
 // ---------- identity hasher for pre-hashed u64 keys ----------
@@ -91,7 +91,11 @@ fn is_leap(y: i64) -> bool { (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 }
 fn parse_ts(b: &[u8]) -> Option<i64> {
     let n = b.len();
     if n == 0 { return None; }
-    if b.iter().all(|c| c.is_ascii_digit()) {
+    // Quick check for F3 (epoch milliseconds): first char is digit and no dashes
+    let c0 = b[0];
+    if c0.is_ascii_digit() && (n < 5 || b[4] != b'-') {
+        // F3: all digits
+        for &c in b { if !c.is_ascii_digit() { return None; } }
         let mut i = 0;
         while i < n && b[i] == b'0' { i += 1; }
         let r = &b[i..];
