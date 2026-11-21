@@ -567,36 +567,39 @@ fn main() {
     };
     lap("clicks parsed");
 
-    // Phase 3: dedup events per eid bucket, map to person buckets
+    // Phase 3: dedup events per eid bucket using sort, map to person buckets
     let ev_by_person: Vec<Vec<Vec<Ev>>> = (0..NB).into_par_iter().fold(new_buckets::<Ev>, |mut out, b| {
         let total: usize = ev_parts.iter().map(|p| p[b].len()).sum();
-        let mut best: IdMap<ERaw> = IdMap::with_capacity_and_hasher(total, Default::default());
-        let mut coll: Vec<ERaw> = Vec::new();
-        for part in &ev_parts {
-            for r in &part[b] {
-                match best.entry(r.eh) {
-                    hashbrown::hash_map::Entry::Vacant(v) => { v.insert(*r); }
-                    hashbrown::hash_map::Entry::Occupied(mut o) => {
-                        let cur = o.get_mut();
-                        if cur.eid != r.eid { coll.push(*r); }
-                        else if r.ingest < cur.ingest { *cur = *r; }
+        let mut all: Vec<ERaw> = Vec::with_capacity(total);
+        for part in &ev_parts { all.extend_from_slice(&part[b]); }
+        // Sort by (event_id hash, ingest_ts) to group duplicates together
+        all.sort_unstable_by(|a, b| a.eh.cmp(&b.eh).then(a.ingest.cmp(&b.ingest)));
+        let mut i = 0;
+        while i < all.len() {
+            let r = &all[i];
+            // Check for hash collision by comparing actual event_id
+            let mut best_idx = i;
+            let mut j = i + 1;
+            while j < all.len() && all[j].eh == r.eh {
+                if all[j].eid == r.eid {
+                    // Same event_id, already sorted by ingest, so first is best
+                } else {
+                    // Hash collision - process this as a separate event
+                    let cr = &all[j];
+                    if cr.valid {
+                        let (pk, name) = people.person(cr.uh, cr.uid);
+                        out[bucket(pk)].push(Ev { pk, ts: cr.ts, name, price: cr.price, cat: cr.cat });
                     }
                 }
+                j += 1;
             }
-        }
-        let mut emit = |r: &ERaw| {
-            if !r.valid { return; }
-            let (pk, name) = people.person(r.uh, r.uid);
-            out[bucket(pk)].push(Ev { pk, ts: r.ts, name, price: r.price, cat: r.cat });
-        };
-        for r in best.values() { emit(r); }
-        if !coll.is_empty() {
-            let mut m: HashMap<S, ERaw> = HashMap::new();
-            for r in coll {
-                let e = m.entry(r.eid).or_insert(r);
-                if r.ingest < e.ingest { *e = r; }
+            // Emit the best (first by ingest_ts) for this event_id
+            let best = &all[best_idx];
+            if best.valid {
+                let (pk, name) = people.person(best.uh, best.uid);
+                out[bucket(pk)].push(Ev { pk, ts: best.ts, name, price: best.price, cat: best.cat });
             }
-            for r in m.values() { emit(r); }
+            i = j;
         }
         out
     }).collect();
