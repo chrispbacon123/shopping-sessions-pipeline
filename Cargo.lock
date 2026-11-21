@@ -712,6 +712,7 @@ dependencies = [
  "arrow-array",
  "arrow-schema",
  "hashbrown",
+ "libc",
  "memchr",
  "memmap2",
  "parquet",

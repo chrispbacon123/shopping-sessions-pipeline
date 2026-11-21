@@ -195,7 +195,7 @@ fn map_file(p: &Path) -> S {
     let len = f.metadata().unwrap().len();
     if len == 0 { return &[]; }
     let m = unsafe { Mmap::map(&f).unwrap() };
-    let _ = m.advise(memmap2::Advice::Sequential);
+    let _ = m.advise(memmap2::Advice::WillNeed);
     let m: &'static Mmap = Box::leak(Box::new(m));
     &m[..]
 }
@@ -646,6 +646,9 @@ fn main() {
         },
     );
     lap("written");
+    
+    // Skip expensive teardown of multi-GB mmaps (1BRC technique)
+    unsafe { libc::_exit(0) };
 }
 
 mod out {

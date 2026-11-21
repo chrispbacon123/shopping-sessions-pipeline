@@ -1,2 +1,6 @@
 target/
 *.log
+testdata/
+testoutput/
+buildathon/
+verify.py
