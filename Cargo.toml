@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 memmap2 = "0.9"
 memchr = "2"
+mimalloc = { version = "0.1", default-features = false }
 rayon = "1.10"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 hashbrown = "0.15"
@@ -21,6 +22,7 @@ panic = "abort"
 debug = false
 
 [profile.quick]
+debug = "line-tables-only"
 inherits = "release"
 lto = false
 codegen-units = 16
