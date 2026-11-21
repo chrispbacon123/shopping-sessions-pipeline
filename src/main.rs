@@ -707,7 +707,7 @@ mod out {
         ]));
         if rows.is_empty() {
             let f = File::create(path).unwrap();
-            let mut w = ArrowWriter::try_new(f, schema, Some(props())).unwrap();
+            let w = ArrowWriter::try_new(f, schema, Some(props())).unwrap();
             w.close().unwrap();
             return;
         }
