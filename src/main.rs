@@ -935,6 +935,20 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
             *p += 1;
         }
     }
+    // Build packed (ts<<32|pc) keys for all events, sort by person
+    // This gives 8-byte sorted entries that we can iterate sequentially
+    acc.ord.clear();
+    acc.ord.reserve(n_in);
+    for pi in 0..npu {
+        let (i, i1) = (acc.estart[pi] as usize, acc.estart[pi + 1] as usize);
+        for e in &acc.evs[i..i1] {
+            acc.ord.push(((e.ts as u64) << 32) | (e.pc as u64));
+        }
+    }
+    for pi in 0..npu {
+        let (i, i1) = (acc.estart[pi] as usize, acc.estart[pi + 1] as usize);
+        if i1 > i + 1 { acc.ord[i..i1].sort_unstable(); }
+    }
     T_SORT.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     let t1 = Instant::now();
     struct D(Instant); impl Drop for D { fn drop(&mut self) { T_PROC.fetch_add(self.0.elapsed().as_nanos() as u64, Relaxed); } }
@@ -942,7 +956,6 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
     let nd = c.ndays;
     let organic = c.ncamp;
     let day0 = c.ws_day;
-    let mut evs = std::mem::take(&mut acc.evs);
     let mut cls = std::mem::take(&mut acc.cls);
     for pi in 0..npu {
         let (i, i1) = (acc.estart[pi] as usize, acc.estart[pi + 1] as usize);
@@ -950,13 +963,8 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
         if j1 - j > 1 {
             cls[j..j1].sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| if a.cid == b.cid { std::cmp::Ordering::Equal } else { field_at(b.cid).cmp(field_at(a.cid)) }));
         }
-        let name = c.resolve_name(evs[i].name, evs[i].rid);
-        let pe = &evs[i..i1];
-        // sort (ts, index) u64 keys instead of moving 24-byte records
-        acc.ord.clear();
-        acc.ord.extend(pe.iter().enumerate().map(|(k, e)| ((e.ts as u64) << 32) | k as u64));
-        acc.ord.sort_unstable();
-        let ord = &acc.ord;
+        let name = c.resolve_name(acc.evs[i].name, acc.evs[i].rid);
+        let packed = &acc.ord[i..i1];
         let pc = &cls[j..j1];
         acc.starts.clear();
         acc.sdays.clear();
@@ -991,19 +999,14 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
                 acc.rows.push(URow { name, day: cur_day as i32, sessions: d_sess, events: d_ev, rev: d_rev, top });
             }
         }}}
-        // Prefetch loop for cache efficiency
-        const PF_DIST: usize = 8;
-        let nev = ord.len();
-        for (idx, &ok) in ord.iter().enumerate() {
-            if idx + PF_DIST < nev {
-                let future_idx = (ord[idx + PF_DIST] & 0xFFFF_FFFF) as usize;
-                unsafe { core::arch::x86_64::_mm_prefetch(pe.as_ptr().add(future_idx) as *const i8, core::arch::x86_64::_MM_HINT_T0); }
-            }
-            let e = unsafe { pe.get_unchecked((ok & 0xFFFF_FFFF) as usize) };
-            if first || e.ts - prev_ts > 1_800_000 {
+        // Process events in timestamp order - packed (ts<<32|pc) values are sorted
+        for &pk in packed {
+            let ts = (pk >> 32) as u32;
+            let pc = pk as u32;
+            if first || ts - prev_ts > 1_800_000 {
                 if !first { close_session!(); }
                 first = false;
-                s_start = e.ts;
+                s_start = ts;
                 s_rev = 0;
                 s_purch = false;
                 let day = (c.base + s_start as i64).div_euclid(DAY);
@@ -1017,14 +1020,14 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
                 }
                 d_sess += 1;
             }
-            prev_ts = e.ts;
+            prev_ts = ts;
             d_ev += 1;
-            let price = e.pc & 0xFF_FFFF;
+            let price = pc & 0xFF_FFFF;
             if price > 0 {
                 let p = price as u64;
                 s_rev += p; s_purch = true;
                 d_rev += p; d_purch = true;
-                acc.catsum[(e.pc >> 24) as usize] += p;
+                acc.catsum[(pc >> 24) as usize] += p;
             }
         }
         close_session!();
@@ -1058,7 +1061,6 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
             }
         }
     }
-    acc.evs = evs;
     acc.cls = cls;
 }
 
