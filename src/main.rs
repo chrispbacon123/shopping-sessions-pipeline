@@ -874,7 +874,7 @@ impl<'a> Ctx<'a> {
     }
 }
 
-struct Acc { camp: Vec<[u64; 4]>, asst: Vec<u32>, evbuf: Vec<Ev>, clbuf: Vec<Cl>, rows: Vec<URow>, catsum: Vec<u64>, starts: Vec<u32>, sdays: Vec<u32>, tmp: Vec<(u16, u32)>,
+struct Acc { camp: Vec<[u64; 4]>, asst: Vec<u32>, evbuf: Vec<Ev>, clbuf: Vec<Cl>, rows: Vec<URow>, catsum: Vec<u64>, starts: Vec<u32>, sdays: Vec<u32>, tmp: Vec<u64>,
     map: Vec<(u64, u32)>, np: u32, pidx: Vec<u32>, cnt: Vec<u32>, estart: Vec<u32>, cstart: Vec<u32>, cpid: Vec<u32>, evs: Vec<Ev>, cls: Vec<Cl>, ord: Vec<u64> }
 impl Acc {
     fn new(c: &Ctx<'_>) -> Self {
@@ -956,7 +956,7 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
         acc.ord.clear();
         acc.ord.extend(pe.iter().enumerate().map(|(k, e)| ((e.ts as u64) << 32) | k as u64));
         acc.ord.sort_unstable();
-        let ord = std::mem::take(&mut acc.ord);
+        let ord = &acc.ord;
         let pc = &cls[j..j1];
         acc.starts.clear();
         acc.sdays.clear();
@@ -1022,29 +1022,29 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
         }
         close_session!();
         flush_day!();
-        acc.ord = ord;
         if !pc.is_empty() {
+            // Assists: pack (camp, ts) into u64 for faster sort on a single primitive
             acc.tmp.clear();
-            acc.tmp.extend(pc.iter().map(|x| (x.camp, x.ts)));
+            acc.tmp.extend(pc.iter().map(|x| ((x.camp as u64) << 32) | (x.ts as u64)));
             acc.tmp.sort_unstable();
             let t = &acc.tmp;
             let starts = &acc.starts;
             let mut k = 0;
             while k < t.len() {
-                let camp = t[k].0;
-                let mut a = t[k].1;
+                let camp = (t[k] >> 32) as u16;
+                let mut a = t[k] as u32;
                 let mut e = a + WEEKU;
                 k += 1;
                 loop {
-                    let more = k < t.len() && t[k].0 == camp;
-                    if more && t[k].1 <= e { e = t[k].1 + WEEKU; k += 1; continue; }
+                    let more = k < t.len() && (t[k] >> 32) as u16 == camp;
+                    if more && (t[k] as u32) <= e { e = (t[k] as u32) + WEEKU; k += 1; continue; }
                     let mut lo = starts.partition_point(|&s| s < a);
                     while lo < starts.len() && starts[lo] <= e {
                         acc.asst[camp as usize * nd + acc.sdays[lo] as usize] += 1;
                         lo += 1;
                     }
                     if !more { break; }
-                    a = t[k].1;
+                    a = t[k] as u32;
                     e = a + WEEKU;
                     k += 1;
                 }
