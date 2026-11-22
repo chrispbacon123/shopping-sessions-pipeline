@@ -25,7 +25,12 @@ static T_PROC: AtomicU64 = AtomicU64::new(0);
 static T_NP: AtomicU64 = AtomicU64::new(0);
 static T_NEV: AtomicU64 = AtomicU64::new(0);
 static T_REGROUP: AtomicU64 = AtomicU64::new(0);
+static T_EP: AtomicU64 = AtomicU64::new(0);
+static T_ER: AtomicU64 = AtomicU64::new(0);
+static T_ES: AtomicU64 = AtomicU64::new(0);
+static T_CL: AtomicU64 = AtomicU64::new(0);
 static FILES: OnceLock<Vec<S>> = OnceLock::new();
+
 #[inline(always)]
 fn files() -> &'static [S] { FILES.get().unwrap() }
 /// Value of the field starting at encoded offset (file<<40 | pos); stops at , \n " or EOF.
@@ -528,6 +533,235 @@ fn for_records<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
     if (bnd[0] as usize) < n { emit!(n, qbase); }
 }
 
+
+// ---------- v11 structural CSV splitter ----------
+// Stage 1 (per 64-byte block, AVX2): comma/newline/quote bitmasks; quote legality is checked with bit
+// algebra (quotes only at field starts/ends, even quote parity at every separator since line start);
+// blocks failing it are listed as "dirty" and their lines take an exact byte-level path. Separator
+// positions are flattened branchlessly into u32 entries: (pos+1) | NL<<29 | quote-after<<30 | quote-before<<31.
+// Stage 2 walks entries line by line: exactly N separators with only the last a newline -> fields.
+const E_NL: u32 = 1 << 29;
+const E_POS: u32 = (1 << 29) - 1;
+const SEG: usize = 16 << 10;
+#[inline(always)]
+fn prefix_xor(mut x: u64) -> u64 { x ^= x << 1; x ^= x << 2; x ^= x << 4; x ^= x << 8; x ^= x << 16; x ^= x << 32; x }
+#[inline(always)]
+fn pext64(x: u64, m: u64) -> u64 { unsafe { core::arch::x86_64::_pext_u64(x, m) } }
+/// Append the low `cnt` bits of x (higher bits zero) at bit position `pos` of a zero-tailed bit stream.
+#[inline(always)]
+fn put_bits(s: &mut [u64], pos: usize, x: u64) {
+    let w = pos >> 6; let o = (pos & 63) as u32;
+    unsafe { *s.get_unchecked_mut(w) |= x << o; *s.get_unchecked_mut(w + 1) = (x >> 1) >> (63 - o); }
+}
+#[inline(always)]
+fn get_bits(s: &[u64], pos: usize) -> u64 {
+    let w = pos >> 6; let o = (pos & 63) as u32;
+    unsafe { (*s.get_unchecked(w) >> o) | ((*s.get_unchecked(w + 1) << 1) << (63 - o)) }
+}
+/// Drop the first k bits of a stream holding `n` bits.
+fn shift_bits(s: &mut [u64], k: usize, n: usize) {
+    if k == 0 { return; }
+    let nw = n.div_ceil(64) + 1;
+    let mut i = 0usize; let mut pos = k;
+    while i < nw { let v = if pos < n + 64 { get_bits(s, pos) } else { 0 }; s[i] = v; i += 1; pos += 64; }
+    let rem = n - k;
+    // clear bits at and above rem
+    let w = rem >> 6; let o = rem & 63;
+    if o != 0 { s[w] &= (1u64 << o) - 1; } else { s[w] = 0; }
+    for x in s[w + 1..].iter_mut() { *x = 0; }
+}
+#[inline(always)]
+fn for_records2<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
+    let n = chunk.len();
+    if n == 0 { return; }
+    if n >= (1 << 28) { return for_records::<N>(chunk, f); }
+    let base = chunk.as_ptr();
+    let virt = (chunk[n - 1] != b'\n') as usize;      // virtual '\n' at n for a last line without one
+    let tot = n + virt;
+    let nblk = tot.div_ceil(64);
+    let mut pad = [0u8; 64];
+    let full = n / 64;                                // blocks entirely inside the chunk
+    if full < nblk {
+        let r = n - full * 64;
+        pad[..r].copy_from_slice(&chunk[full * 64..]);
+        if virt == 1 { pad[r] = b'\n'; }
+    }
+    let masks = |bi: usize| -> (u64, u64, u64) {      // (comma, quote, newline)
+        if bi < full { mask3(unsafe { base.add(bi * 64) }) } else if bi < nblk { mask3(pad.as_ptr()) } else { (0, 0, 0) }
+    };
+    // entries: separator position + 1; parallel bit streams: is-newline, quote after, quote before
+    let mut ent: Vec<u32> = Vec::with_capacity(SEG + 256);
+    let mut bnl: Vec<u64> = vec![0; (SEG + 256) / 64 + 4];
+    let mut bsq: Vec<u64> = vec![0; (SEG + 256) / 64 + 4];
+    let mut beq: Vec<u64> = vec![0; (SEG + 256) / 64 + 4];
+    let mut dirty: Vec<u32> = Vec::new();
+    ent.push(0);
+    bnl[0] = 1; bsq[0] = (chunk[0] == b'"') as u64;
+    let mut lastnl: usize = 0;
+    let mut ls: usize = 0;
+    let mut di: usize = 0;
+    let mut prev_sep_top: u64 = 1;
+    let mut prev_q_top: u64 = 0;
+    let mut qpar: u64 = 0;
+    let (mut cm, mut qm, mut nm) = masks(0);
+    let mut out: [S; N] = [&[]; N];
+    let lmask: u64 = (2u64 << N) - 1;
+    let mut bi = 0usize;
+    while bi < nblk {
+        let seg_end = (bi + SEG / 64).min(nblk);
+        let need = ent.len() + SEG + 128;
+        if ent.capacity() < need { ent.reserve(need - ent.len()); }
+        let wneed = need / 64 + 4;
+        if bnl.len() < wneed { bnl.resize(wneed, 0); bsq.resize(wneed, 0); beq.resize(wneed, 0); }
+        // ---- stage 1 ----
+        while bi < seg_end {
+            let (cm1, qm1, nm1) = masks(bi + 1);
+            let seps = cm | nm;
+            let s_m = (seps << 1) | prev_sep_top;
+            let e_m = (seps >> 1) | ((cm1 | nm1) << 63);
+            let px = prefix_xor(qm) ^ qpar;
+            let bad = (qm & !(s_m | e_m)) | (seps & px);
+            if bad != 0 { dirty.push(bi as u32); }
+            let l = 63 - (nm | 1).leading_zeros();
+            let c_end = (px >> 63) ^ if nm != 0 { (px >> l) & 1 } else { 0 };
+            qpar = 0u64.wrapping_sub(c_end);
+            let sq = ((qm >> 1) | (qm1 << 63)) & seps;
+            let eq = ((qm << 1) | prev_q_top) & seps;
+            let cnt = seps.count_ones() as usize;
+            let len = ent.len();
+            unsafe {
+                let p = ent.as_mut_ptr().add(len);
+                let bv = (bi * 64 + 1) as u32;
+                let mut m = seps;
+                macro_rules! one { ($j:expr) => {{ *p.add($j) = bv + m.trailing_zeros(); m &= m.wrapping_sub(1); }} }
+                one!(0); one!(1); one!(2); one!(3); one!(4); one!(5); one!(6); one!(7);
+                if cnt > 8 {
+                    let mut j = 8usize;
+                    while j < cnt { one!(j); one!(j + 1); one!(j + 2); one!(j + 3); j += 4; }
+                }
+                ent.set_len(len + cnt);
+            }
+            if cnt != 0 {
+                put_bits(&mut bnl, len, pext64(nm, seps));
+                put_bits(&mut bsq, len, pext64(sq, seps));
+                put_bits(&mut beq, len, pext64(eq, seps));
+            }
+            if nm != 0 {
+                let below = if l == 63 { seps } else { seps & ((2u64 << l) - 1) };
+                lastnl = len + below.count_ones() as usize - 1;
+            }
+            prev_sep_top = seps >> 63;
+            prev_q_top = qm >> 63;
+            cm = cm1; qm = qm1; nm = nm1;
+            bi += 1;
+        }
+        // ---- stage 2: complete lines up to entry lastnl ----
+        let e = ent.as_ptr();
+        while ls < lastnl {
+            let wnl = get_bits(&bnl, ls) & lmask;
+            if ls + N <= lastnl && wnl == (1u64 << N) | 1 {
+                let w = unsafe { std::slice::from_raw_parts(e.add(ls), N + 1) };
+                let lstart = w[0];                    // first byte of the line
+                let lend = w[N] - 1;                  // its newline
+                while di < dirty.len() && dirty[di] < (lstart >> 6) { di += 1; }
+                if di < dirty.len() && dirty[di] <= (lend >> 6) {
+                    let mut quoted = 0u32; let mut bad = false;
+                    for k in 0..N {
+                        let st = w[k] as usize;
+                        let en = (w[k + 1] - 1) as usize;
+                        let mut fs = st; let mut fe = en;
+                        if en > st {
+                            let a = unsafe { *base.add(st) } == b'"';
+                            let b = unsafe { *base.add(en - 1) } == b'"';
+                            if a | b { bad |= (a != b) | (en - st < 2); quoted += 1; fs = st + 1; fe = if en - st >= 2 { en - 1 } else { st + 1 }; }
+                        }
+                        out[k] = unsafe { std::slice::from_raw_parts(base.add(fs), fe - fs) };
+                    }
+                    let le = (lend as usize).min(n);
+                    let qn = chunk[lstart as usize..le].iter().filter(|&&c| c == b'"').count() as u32;
+                    if !bad && qn == 2 * quoted { f(&out); }
+                } else {
+                    let sqw = get_bits(&bsq, ls);
+                    let eqw = get_bits(&beq, ls);
+                    for k in 0..N {
+                        let st = w[k] + ((sqw >> k) & 1) as u32;
+                        let en = w[k + 1] - 1 - ((eqw >> (k + 1)) & 1) as u32;
+                        out[k] = unsafe { std::slice::from_raw_parts(base.add(st as usize), (en - st) as usize) };
+                    }
+                    f(&out);
+                }
+                ls += N;
+                continue;
+            }
+            // malformed field count: skip to the next newline entry
+            let mut j = ls + 1;
+            loop {
+                let wb = get_bits(&bnl, j);
+                if wb != 0 { j += wb.trailing_zeros() as usize; break; }
+                j += 64;
+            }
+            ls = j;
+        }
+        // ---- compact: keep the line-start separator and the incomplete line ----
+        if lastnl > 0 {
+            let len = ent.len();
+            ent.drain(..lastnl);
+            shift_bits(&mut bnl, lastnl, len); shift_bits(&mut bsq, lastnl, len); shift_bits(&mut beq, lastnl, len);
+            lastnl = 0; ls = 0;
+        }
+        if di > 0 { dirty.drain(..di); di = 0; }
+    }
+}
+
+/// Reference splitter (line-by-line, rules.md dialect) for fuzzing.
+fn for_records_ref<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
+    let mut out: [S; N] = [&[]; N];
+    for_lines(chunk, |l| if parse_line(l, &mut out) { f(&out) });
+}
+
+fn fuzz_csv2() {
+    let mut x: u64 = 0x9E3779B97F4A7C15;
+    let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
+    let mut total = 0usize;
+    let iters: u32 = std::env::var("FUZZN").ok().and_then(|s| s.parse().ok()).unwrap_or(300_000);
+    for it in 0..iters {
+        let mut buf: Vec<u8> = Vec::new();
+        let nlines = if it % 50 == 0 { 300 + rnd() % 3000 } else { 1 + rnd() % 40 };
+        let qrate = 1 + rnd() % 40;
+        for _ in 0..nlines {
+            let nf = 1 + (rnd() % 9) as usize;
+            for k in 0..nf {
+                if k > 0 { buf.push(b','); }
+                let flen = match rnd() % 8 { 0 => (rnd() % 70) as usize, 1 => 33 + (rnd() % 10) as usize, _ => (rnd() % 6) as usize };
+                let body: Vec<u8> = (0..flen).map(|_| { let r = rnd(); if r % (qrate * 4) == 0 { b'"' } else if r % 97 == 1 { b'\r' } else { b'a' + (r % 26) as u8 } }).collect();
+                match rnd() % 7 {
+                    0 | 1 => { buf.push(b'"'); buf.extend_from_slice(&body); buf.push(b'"'); }
+                    2 => { if rnd() % qrate == 0 { buf.push(b'"'); } buf.extend_from_slice(&body); }
+                    3 => { buf.extend_from_slice(&body); if rnd() % qrate == 0 { buf.push(b'"'); } }
+                    _ => buf.extend_from_slice(&body),
+                }
+            }
+            if rnd() % 30 != 0 { buf.push(b'\n'); }
+        }
+        if rnd() % 3 == 0 && !buf.is_empty() && *buf.last().unwrap() != b'\n' { buf.push(b'\n'); }
+        let bptr = Box::into_raw(buf.into_boxed_slice());
+        let buf: &'static [u8] = unsafe { &*bptr };
+        macro_rules! cmp { ($n:expr) => {{
+            let mut a: Vec<Vec<Vec<u8>>> = Vec::new(); let mut b: Vec<Vec<Vec<u8>>> = Vec::new();
+            for_records_ref::<$n>(buf, |f| a.push(f.iter().map(|x| x.to_vec()).collect()));
+            for_records2::<$n>(buf, |f| b.push(f.iter().map(|x| x.to_vec()).collect()));
+            total += a.len();
+            if a != b { panic!("mismatch N={} it={} ref={} new={} buf={:?}", $n, it, a.len(), b.len(), String::from_utf8_lossy(buf)); }
+            let mut c: Vec<Vec<Vec<u8>>> = Vec::new();
+            for_records::<$n>(buf, |f| c.push(f.iter().map(|x| x.to_vec()).collect()));
+            if a != c { panic!("v9 mismatch N={} it={}", $n, it); }
+        }}}
+        cmp!(2); cmp!(4); cmp!(7);
+        drop(unsafe { Box::from_raw(bptr) });
+    }
+    eprintln!("fuzz_csv2 ok, {} records compared", total);
+}
+
 /// Parses every line of a chunk into exactly N fields (rules.md dialect), calling f for each well-formed line.
 /// `safe_end`: bytes of the underlying file available after chunk end (for 64-byte over-reads).
 #[inline(always)]
@@ -842,7 +1076,7 @@ fn build_people(link_fis: &[usize]) -> People {
     let pairs: Vec<Vec<(u64, u64, u64, u64)>> = ch.par_iter().map(|c| {
         let d = c.data();
         let mut v = Vec::with_capacity(d.len() / 20);
-        for_records::<2>(d, |f| {
+        for_records2::<2>(d, |f| {
             if f[0].is_empty() || f[1].is_empty() { return; }
             v.push((hs(f[0]), c.off(f[0]), hs(f[1]), c.off(f[1])));
         });
@@ -1234,6 +1468,7 @@ fn main() {
     let base = ws - WEEK;
     assert!(we - base < u32::MAX as i64, "window too long for u32 relative ms");
     if std::env::var_os("FUZZTS").is_some() { fuzz_ts(ws, we); return; }
+    if std::env::var_os("FUZZCSV").is_some() { fuzz_csv2(); return; }
     let fast_ts = std::env::var_os("NO_FASTTS").is_none();
     let dtab_v = DateTab::new(ws_day - 12, (we - 1).div_euclid(DAY) + 12);
     let dtab = &dtab_v;
@@ -1278,7 +1513,7 @@ fn main() {
     let cl_fis: Vec<usize> = (2 + ln_p.len()..2 + ln_p.len() + cl_p.len()).collect();
     let ev_fis: Vec<usize> = (2 + ln_p.len() + cl_p.len()..all.len()).collect();
     lap("mapped");
-    if std::env::var("BENCH").is_ok() { bench(&ev_fis); return; }
+    if std::env::var("BENCH").is_ok() { bench(&ev_fis, dtab); return; }
     if std::env::var("BENCHCL").is_ok() {
         let ch = chunks(&cl_fis, 8 << 20); let mut acc = 0u64; let mut nl = 0u64;
         let t = Instant::now(); for c in &ch { for_records::<4>(c.data(), |f| { acc += f[0].len() as u64; nl += 1; }); }
@@ -1331,7 +1566,8 @@ fn main() {
                 let ibase = base / 1000 - 40 * 86400;
                 let cid = (ci as u32) << lbits;
                 let mut local: u32 = 0;
-                for_records::<7>(d, |f| {
+                let tj = Instant::now();
+                for_records2::<7>(d, |f| {
                     let eid = f[0];
                     if eid.is_empty() { return; }
                     let ing_ms = if fast_ts { parse_ts_fast(f[3], dtab).unwrap_or(i64::MAX) } else { parse_f1_fast(f[3]).unwrap_or_else(|| parse_ts(f[3]).unwrap_or(i64::MAX)) };
@@ -1362,22 +1598,27 @@ fn main() {
                     eb.push(Ev { pk: uh, ts: (ts - base) as u32, rid: cid, pc: price | ((cat as u32) << 24), name: noff });
                 });
                 assert!(local <= lmask, "chunk too large");
+                let t1 = Instant::now();
                 people.resolve_all(eb, |e| e.pk, |e, pk, i| { e.pk = pk; e.name = (1u32 << 31) | i; });
+                let t2 = Instant::now();
                 let evs = scatter_ev(eb, perm);
                 for r in kb.iter_mut() { if r.rid != NO_EV { r.rid = cid | unsafe { *perm.get_unchecked(r.rid as usize) }; } }
-                EvPart { keys: scatter_b(kb, kbk), evs }
+                let r = EvPart { keys: scatter_b(kb, kbk), evs };
+                let t3 = Instant::now();
+                T_EP.fetch_add((t1-tj).as_nanos() as u64, Relaxed); T_ER.fetch_add((t2-t1).as_nanos() as u64, Relaxed); T_ES.fetch_add((t3-t2).as_nanos() as u64, Relaxed);
+                r
     };
     let cl_job = |raw: &mut Vec<Cl>, c: &Chunk| -> (Vec<Cl>, Vec<u32>) {
-                let d = c.data();
+                let d = c.data(); let tc = Instant::now();
                 raw.clear(); raw.reserve(d.len() / 45);
-                for_records::<4>(d, |f| {
+                for_records2::<4>(d, |f| {
                     if f[0].is_empty() || f[1].is_empty() { return; }
                     let ts = match if fast_ts { parse_ts_fast(f[3], dtab) } else { parse_ts(f[3]) } { Some(t) if t >= cws && t < we => t, _ => return };
                     let camp = match clook.get(f[2]) { Some(c) => c, None => return };
                     raw.push(Cl { pk: hs(f[1]), cid: c.off(f[0]), ts: (ts - base) as u32, camp });
                 });
                 resolve_clicks(&people, raw);
-                scatter(raw, |r| bucket(r.pk))
+                let r = scatter(raw, |r| bucket(r.pk)); T_CL.fetch_add(tc.elapsed().as_nanos() as u64, Relaxed); r
     };
     // Work queue in file order (clicks, then events) so consumption follows the prefetcher's read order.
     let ncl = cch.len();
@@ -1403,6 +1644,7 @@ fn main() {
     let cl_parts: Vec<(Vec<Cl>, Vec<u32>)> = cl_slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
     arena::STOP.store(true, Relaxed);
     lap("events + clicks parsed");
+    if verbose { eprintln!("  thread-ms evparse {} evresolve {} evscatter {} clicks {}", T_EP.load(Relaxed)/1000000, T_ER.load(Relaxed)/1000000, T_ES.load(Relaxed)/1000000, T_CL.load(Relaxed)/1000000); }
 
     // Phase 3: dedup on event_id -> loser bitmap
     // A losing copy that became an event gets its persisted EvP flagged (ts = u32::MAX). Each EvP has
@@ -1580,12 +1822,38 @@ fn main() {
 }
 
 
-fn bench(ev_fis: &[usize]) {
+fn bench(ev_fis: &[usize], dt: &DateTab) {
     let ch = chunks(ev_fis, 8 << 20);
     let mut acc = 0u64;
     let t = Instant::now();
     for c in &ch { for_lines(c.data(), |l| acc += l.len() as u64); }
     eprintln!("lines only {:.0} ms", t.elapsed().as_secs_f64()*1e3);
+    for _ in 0..2 {
+    let t = Instant::now();
+    let a: u64 = ch.par_iter().map(|c| { let mut acc=0u64; let d=c.data(); let mut b=0; while b+64<=d.len() { let (x,y,z)=masks64(d[b..b+64].try_into().unwrap()); acc+=(x^y^z).count_ones() as u64; b+=64; } acc }).sum();
+    eprintln!("PAR mask floor {:.0} ms {}", t.elapsed().as_secs_f64()*1e3, a);
+    let t = Instant::now();
+    let a: u64 = ch.par_iter().map(|c| { let mut acc=0u64; for_records::<7>(c.data(), |f| acc += f[0].len() as u64); acc }).sum();
+    eprintln!("PAR records {:.0} ms {}", t.elapsed().as_secs_f64()*1e3, a);
+    let t = Instant::now();
+    let a: u64 = ch.par_iter().map(|c| { let mut acc=0u64; for_records2::<7>(c.data(), |f| acc += f[0].len() as u64); acc }).sum();
+    eprintln!("PAR records2 {:.0} ms {}", t.elapsed().as_secs_f64()*1e3, a);
+    let t = Instant::now();
+    let a: u64 = ch.par_iter().map(|c| { let mut acc=0u64; for_records::<7>(c.data(), |f| acc += f.iter().map(|x| x.len() as u64 * 31 + x.first().copied().unwrap_or(0) as u64).sum::<u64>()); acc }).sum();
+    eprintln!("PAR records-all {:.0} ms {}", t.elapsed().as_secs_f64()*1e3, a);
+    let t = Instant::now();
+    let a: u64 = ch.par_iter().map(|c| { let mut acc=0u64; for_records2::<7>(c.data(), |f| acc += f.iter().map(|x| x.len() as u64 * 31 + x.first().copied().unwrap_or(0) as u64).sum::<u64>()); acc }).sum();
+    eprintln!("PAR records2-all {:.0} ms {}", t.elapsed().as_secs_f64()*1e3, a);
+    let t = Instant::now();
+    let a: u64 = ch.par_iter().map(|c| { let mut acc=0u64; for_records::<7>(c.data(), |f| acc += parse_ts_fast(f[2], dt).unwrap_or(0) as u64 + parse_ts_fast(f[3], dt).unwrap_or(0) as u64); acc }).sum();
+    eprintln!("PAR records+ts {:.0} ms {}", t.elapsed().as_secs_f64()*1e3, a);
+    let t = Instant::now();
+    let a: u64 = ch.par_iter().map(|c| { let mut acc=0u64; for_records::<7>(c.data(), |f| acc += (xxh3_128(f[0]) as u64) ^ hs(f[1])); acc }).sum();
+    eprintln!("PAR records+hash {:.0} ms {}", t.elapsed().as_secs_f64()*1e3, a);
+    let t = Instant::now();
+    let a: u64 = ch.par_iter().map(|c| { let mut v: Vec<(u64,u64,u64)> = Vec::with_capacity(c.data().len()/40); for_records::<7>(c.data(), |f| v.push((f[0].len() as u64, f[1].len() as u64, 0))); v.len() as u64 }).sum();
+    eprintln!("PAR records+push24 {:.0} ms {}", t.elapsed().as_secs_f64()*1e3, a);
+    }
     let t = Instant::now();
     for c in &ch { let d=c.data(); let mut b=0; while b+64<=d.len() { let (x,y,z)=masks64(d[b..b+64].try_into().unwrap()); let mut m=x|y; while m!=0 { acc+= (m.trailing_zeros() as u64) ^ (y>>1 &1); m&=m-1;} acc+=z; b+=64; } }
     eprintln!("mask floor {:.0} ms", t.elapsed().as_secs_f64()*1e3);
