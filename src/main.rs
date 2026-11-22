@@ -917,12 +917,115 @@ impl<T> OutBuf<T> {
 impl<T> std::ops::Deref for OutBuf<T> { type Target = [T]; fn deref(&self) -> &[T] { unsafe { std::slice::from_raw_parts(self.ptr, self.len) } } }
 impl<T> std::ops::DerefMut for OutBuf<T> { fn deref_mut(&mut self) -> &mut [T] { unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) } } }
 
+// ---------- software write-combining scatter with non-temporal full-line stores ----------
+// Each bucket stages its next output bytes in a 128-byte buffer; a cache line wholly owned by the
+// bucket is written with streaming stores (no read-for-ownership of fresh output memory), lines
+// shared with a neighbouring bucket or allocation are written byte-exactly with normal stores.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+struct WcLine([u8; 128]);
+static WC_OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn wc_on() -> bool { !*WC_OFF.get_or_init(|| std::env::var("WC").map(|v| v == "0").unwrap_or(false)) }
+struct Wc { buf: Vec<WcLine> }
+impl Wc {
+    fn new() -> Self { Wc { buf: vec![WcLine([0; 128]); NB] } }
+    /// out: base of the destination array; cnt: bucket offsets (in items); place(i) -> (bucket, item);
+    /// after(i, slot) is called with each item's output slot.
+    #[inline(always)]
+    unsafe fn run<T: Copy>(&mut self, out: *mut T, cnt: &[u32], n: usize, mut place: impl FnMut(usize) -> (usize, T), mut after: impl FnMut(usize, u32)) {
+        use core::arch::x86_64::*;
+        let sz = std::mem::size_of::<T>();
+        debug_assert!(sz <= 64);
+        let base = out as usize;
+        let mut pos: Vec<u32> = cnt[..NB].to_vec();
+        let bufp = self.buf.as_mut_ptr() as *mut u8;
+        for i in 0..n {
+            let (b, x) = place(i);
+            let o = *pos.get_unchecked(b);
+            *pos.get_unchecked_mut(b) = o + 1;
+            after(i, o);
+            let d = base + o as usize * sz;
+            let off = d & 63;
+            let bb = bufp.add(b * 128);
+            (bb.add(off) as *mut T).write_unaligned(x);
+            if off + sz >= 64 {
+                let line = d & !63;
+                let sb = base + *cnt.get_unchecked(b) as usize * sz;
+                if sb <= line {
+                    let src = bb as *const __m256i;
+                    _mm256_stream_si256(line as *mut __m256i, _mm256_load_si256(src));
+                    _mm256_stream_si256((line + 32) as *mut __m256i, _mm256_load_si256(src.add(1)));
+                } else {
+                    let lo = sb - line;
+                    std::ptr::copy_nonoverlapping(bb.add(lo), (line + lo) as *mut u8, 64 - lo);
+                }
+                _mm256_store_si256(bb as *mut __m256i, _mm256_load_si256(bb.add(64) as *const __m256i));
+            }
+        }
+        // partial last lines
+        for b in 0..NB {
+            let s0 = *cnt.get_unchecked(b) as usize; let e0 = *pos.get_unchecked(b) as usize;
+            if e0 == s0 { continue; }
+            let sb = base + s0 * sz; let eb = base + e0 * sz;
+            let line = eb & !63;
+            if eb == line { continue; }
+            let from = sb.max(line);
+            std::ptr::copy_nonoverlapping(bufp.add(b * 128 + (from - line)), from as *mut u8, eb - from);
+        }
+        _mm_sfence();
+    }
+}
+fn fuzz_wc() {
+    let mut st: u64 = 0x243F6A8885A308D3;
+    let mut rnd = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
+    fn one<T: Copy + PartialEq + std::fmt::Debug>(w: &mut Wc, items: &[(usize, T)], shift: usize) {
+        let n = items.len(); let sz = std::mem::size_of::<T>();
+        let mut cnt = vec![0u32; NB + 1];
+        for &(b, _) in items { cnt[b + 1] += 1; }
+        for i in 0..NB { cnt[i + 1] += cnt[i]; }
+        let mut raw = vec![0xA5u8; n * sz + 256];
+        let out = unsafe { raw.as_mut_ptr().add(64 + shift) } as *mut T;
+        let mut slots = vec![0u32; n];
+        unsafe { w.run(out, &cnt, n, |i| items[i], |i, o| slots[i] = o); }
+        let mut pos = cnt.clone();
+        for (i, &(b, x)) in items.iter().enumerate() {
+            assert_eq!(slots[i], pos[b], "slot"); 
+            let got = unsafe { (out.add(pos[b] as usize) as *const T).read_unaligned() };
+            assert_eq!(got, x, "item {} bucket {}", i, b);
+            pos[b] += 1;
+        }
+        let o = 64 + shift;
+        assert!(raw[..o].iter().all(|&c| c == 0xA5) && raw[o + n * sz..].iter().all(|&c| c == 0xA5), "guard");
+    }
+    let mut w = Wc::new();
+    let iters: usize = std::env::var("FUZZN").ok().and_then(|v| v.parse().ok()).unwrap_or(20000);
+    for it in 0..iters {
+        let n = (rnd() % 3000) as usize;
+        let nb = 1 + (rnd() % NB as u64) as usize;
+        let skew = rnd() % 3;
+        let shift = (rnd() % 64) as usize;
+        let pick = |a: u64, b: u64, c: u64| -> usize { let _ = c; match skew { 0 => (a % nb as u64) as usize, 1 => if a % 4 == 0 { (b % NB as u64) as usize } else { 7 }, _ => ((a % nb as u64) * (b % nb as u64) % NB as u64) as usize } };
+        if it % 2 == 0 {
+            let items: Vec<(usize, [u32; 5])> = (0..n).map(|i| { let (a, b, c) = (rnd(), rnd(), rnd()); (pick(a, b, c), [i as u32, c as u32, (c >> 32) as u32, it as u32, !(i as u32)]) }).collect();
+            one(&mut w, &items, shift);
+        } else {
+            let items: Vec<(usize, [u64; 2])> = (0..n).map(|i| { let (a, b, c) = (rnd(), rnd(), rnd()); (pick(a, b, c), [i as u64 ^ c, it as u64]) }).collect();
+            one(&mut w, &items, shift);
+        }
+    }
+    eprintln!("fuzz_wc ok, {} cases", iters);
+}
+thread_local! { static WC: std::cell::RefCell<Wc> = std::cell::RefCell::new(Wc::new()); }
 fn scatter_b<T: Copy>(v: &[T], bk: &[u16]) -> (OutBuf<T>, Vec<u32>) {
     let mut cnt = vec![0u32; NB + 1];
     for &b in bk { cnt[b as usize + 1] += 1; }
     for i in 0..NB { cnt[i + 1] += cnt[i]; }
-    let mut pos = cnt.clone();
     let out = OutBuf::<T>::uninit(v.len());
+    if wc_on() && std::mem::size_of::<T>() <= 64 {
+        WC.with(|w| unsafe { w.borrow_mut().run(out.ptr, &cnt, v.len(), |i| (*bk.get_unchecked(i) as usize, *v.get_unchecked(i)), |_, _| {}) });
+        return (out, cnt);
+    }
+    let mut pos = cnt.clone();
     unsafe {
         let p = out.ptr;
         for (x, &b) in v.iter().zip(bk) { let b = b as usize; *p.add(pos[b] as usize) = *x; pos[b] += 1; }
@@ -959,9 +1062,15 @@ fn scatter_ev(v: &[Ev], perm: &mut Vec<u32>) -> (OutBuf<EvP>, Vec<u32>) {
     let mut cnt = vec![0u32; NB + 1];
     for x in v { cnt[bucket(x.pk) + 1] += 1; }
     for i in 0..NB { cnt[i + 1] += cnt[i]; }
-    let mut pos = cnt.clone();
     perm.clear(); perm.reserve(v.len());
     let out = OutBuf::<EvP>::uninit(v.len());
+    if wc_on() {
+        unsafe { perm.set_len(v.len()); }
+        let pp = perm.as_mut_ptr();
+        WC.with(|w| unsafe { w.borrow_mut().run(out.ptr, &cnt, v.len(), |i| { let x = v.get_unchecked(i); (bucket(x.pk), EvP { pk_lo: x.pk as u32, pk_hi: (x.pk >> 32) as u32, ts: x.ts, pc: x.pc, name: x.name }) }, |i, o| *pp.add(i) = o) });
+        return (out, cnt);
+    }
+    let mut pos = cnt.clone();
     unsafe {
         let p = out.ptr;
         for x in v {
@@ -1513,6 +1622,7 @@ fn main() {
     let cl_fis: Vec<usize> = (2 + ln_p.len()..2 + ln_p.len() + cl_p.len()).collect();
     let ev_fis: Vec<usize> = (2 + ln_p.len() + cl_p.len()..all.len()).collect();
     lap("mapped");
+    if std::env::var("FUZZWC").is_ok() { fuzz_wc(); return; }
     if std::env::var("BENCH").is_ok() { bench(&ev_fis, dtab); return; }
     if std::env::var("BENCHCL").is_ok() {
         let ch = chunks(&cl_fis, 8 << 20); let mut acc = 0u64; let mut nl = 0u64;
