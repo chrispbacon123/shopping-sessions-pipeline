@@ -1271,11 +1271,11 @@ impl<'a> Ctx<'a> {
 }
 
 struct Acc { camp: Vec<[u64; 4]>, asst: Vec<u32>, evbuf: Vec<Ev>, clbuf: Vec<Cl>, rows: Vec<URow>, catsum: Vec<u64>, starts: Vec<u32>, sdays: Vec<u32>, tmp: Vec<u64>,
-    map: Vec<(u64, u32)>, np: u32, pidx: Vec<u32>, cnt: Vec<u32>, estart: Vec<u32>, cstart: Vec<u32>, cpid: Vec<u32>, evs: Vec<Ev>, cls: Vec<Cl>, ord: Vec<u64>, pnames: Vec<u64> }
+    map: Vec<(u64, u32)>, np: u32, pidx: Vec<u32>, cnt: Vec<u32>, estart: Vec<u32>, cstart: Vec<u32>, cpid: Vec<u32>, evs: Vec<Ev>, cls: Vec<Cl>, ord: Vec<u64>, pnames: Vec<u64>, kbuf: Vec<u64> }
 impl Acc {
     fn new(c: &Ctx<'_>) -> Self {
         Acc { camp: vec![[0; 4]; (c.ncamp + 1) * c.ndays], asst: vec![0; (c.ncamp + 1) * c.ndays], evbuf: Vec::new(), clbuf: Vec::new(), rows: Vec::new(), catsum: vec![0; c.ncat], starts: Vec::new(), sdays: Vec::new(), tmp: Vec::new(),
-            map: Vec::new(), np: 0, pidx: Vec::new(), cnt: Vec::new(), estart: Vec::new(), cstart: Vec::new(), cpid: Vec::new(), evs: Vec::new(), cls: Vec::new(), ord: Vec::new(), pnames: Vec::new() }
+            map: Vec::new(), np: 0, pidx: Vec::new(), cnt: Vec::new(), estart: Vec::new(), cstart: Vec::new(), cpid: Vec::new(), evs: Vec::new(), cls: Vec::new(), ord: Vec::new(), pnames: Vec::new(), kbuf: Vec::new() }
     }
 }
 
@@ -1333,10 +1333,10 @@ fn dedup_bucket(runs: &[&[KeyRec]], sc: &mut DedupScratch, mark: &impl Fn(u32)) 
     }
 }
 
-fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: &mut Acc) {
+fn process_bucket(c: &Ctx<'_>, keys: &[u64], cls_in: &mut Vec<Cl>, acc: &mut Acc) {
     let t0 = Instant::now();
-    // grouping (map/pidx/cnt) was built during gather
-    let n_in = evs_in.len();
+    // grouping (map/pidx/cnt/pnames) was built during gather; keys[i] = ts<<32|pc of event i
+    let n_in = keys.len();
     let np = acc.np;
     let mask = acc.map.len() - 1;
     let npu = np as usize;
@@ -1345,21 +1345,18 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
     let mut run = 0u32;
     for &k in acc.cnt.iter() { acc.estart.push(run); run += k; }
     acc.estart.push(run);
-    // Scatter packed (ts<<32|pc) directly to acc.ord, store first event's (name, rid) per person
+    // Scatter packed (ts<<32|pc) to acc.ord grouped by person
     acc.ord.clear(); acc.ord.reserve(n_in);
     unsafe { acc.ord.set_len(n_in); }
-    acc.pnames.clear(); acc.pnames.resize(npu, 0);
     {
         let mut pos: Vec<u32> = acc.estart[..npu].to_vec();
-        for (e, &id) in evs_in.iter().zip(acc.pidx.iter()) {
-            let idu = id as usize;
-            let p = pos[idu];
-            // First event for this person: store (name<<32|rid)
-            if p == acc.estart[idu] {
-                acc.pnames[idu] = ((e.name as u64) << 32) | (e.rid as u64);
+        let ord = acc.ord.as_mut_ptr();
+        for (&k, &id) in keys.iter().zip(acc.pidx.iter()) {
+            unsafe {
+                let p = pos.get_unchecked_mut(id as usize);
+                *ord.add(*p as usize) = k;
+                *p += 1;
             }
-            acc.ord[p as usize] = ((e.ts as u64) << 32) | (e.pc as u64);
-            pos[idu] = p + 1;
         }
     }
     // clicks: only persons with events matter
@@ -1422,7 +1419,16 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
     let organic = c.ncamp;
     let day0 = c.ws_day;
     let mut cls = std::mem::take(&mut acc.cls);
+    const PFD: usize = 8;
+    let pf_name = |pi: usize| {
+        if pi < npu {
+            let n = (acc.pnames[pi] >> 32) as u32;
+            if n >> 31 == 1 { unsafe { core::arch::x86_64::_mm_prefetch(c.people.offs.as_ptr().add((n & 0x7FFF_FFFF) as usize) as *const i8, core::arch::x86_64::_MM_HINT_T0); } }
+        }
+    };
+    for pi in 0..PFD.min(npu) { pf_name(pi); }
     for pi in 0..npu {
+        pf_name(pi + PFD);
         let (i, i1) = (acc.estart[pi] as usize, acc.estart[pi + 1] as usize);
         let (j, j1) = (acc.cstart[pi] as usize, acc.cstart[pi + 1] as usize);
         if j1 - j > 1 {
@@ -1814,76 +1820,79 @@ fn main() {
     // biggest buckets first for better balance
     let mut order: Vec<(usize, usize)> = (0..NB).map(|b| (ev_parts.iter().map(|p| (p.evs.1[b + 1] - p.evs.1[b]) as usize).sum::<usize>(), b)).collect();
     order.sort_unstable_by(|x, y| y.cmp(x));
-    order.par_iter().with_max_len(1).for_each(|&(_, b)| {
+    order.par_iter().with_max_len(1).for_each(|&(nb_ev0, b)| {
         let ti = rayon::current_thread_index().unwrap_or(nthreads);
         let mut g = slots[ti].lock().unwrap();
         let acc = g.get_or_insert_with(|| { let mut a = Acc::new(&ctx); a.rows.reserve(nrec / 7 / nthreads + 1024); a });
         let t0 = Instant::now();
-        let mut evs = std::mem::take(&mut acc.evbuf);
+        let mut keys = std::mem::take(&mut acc.kbuf);
         let mut cls = std::mem::take(&mut acc.clbuf);
-        evs.clear();
-        let nb_ev: usize = ev_parts.iter().map(|p| (p.evs.1[b + 1] - p.evs.1[b]) as usize).sum();
-        evs.reserve(nb_ev);
+        let nb_ev = nb_ev0;
+        keys.clear();
+        keys.reserve(nb_ev);
         // Person map sized for ~events/GDIV persons so it stays cache-resident; if a bucket has more
-        // persons than that (load > 3/4), fall back to the old events-sized map after the gather.
-        let cap = (nb_ev / gdiv + 64).next_power_of_two();
-        let mut mask = cap - 1;
-        let mut lim = (cap / 4 * 3) as u32;
-        acc.map.clear();
-        acc.map.resize(cap, (0u64, u32::MAX));
-        acc.pidx.clear();
-        acc.pidx.reserve(nb_ev);
-        acc.cnt.clear();
-        let mut np: u32 = 0;
-        let mut grouping = true;
-        cls.clear();
-        cls.reserve(cl_parts.iter().map(|p| (p.1[b + 1] - p.1[b]) as usize).sum());
-        for (ci, p) in ev_parts.iter().enumerate() {
-            let (v, off) = &p.evs;
-            let crid = (ci as u32) << lbits;
-            for ep in &v[off[b] as usize..off[b + 1] as usize] {
-                if ep.ts != u32::MAX {
-                    let e = Ev { pk: (ep.pk_lo as u64) | ((ep.pk_hi as u64) << 32), ts: ep.ts, rid: crid, pc: ep.pc, name: ep.name };
-                    evs.push(e);
-                    if !grouping { continue; }
-                    if np >= lim { grouping = false; continue; }
-                    let mut q = (e.pk as usize) & mask;
+        // persons than that (load > 3/4), redo the gather with an events-sized map.
+        let mut cap = (nb_ev / gdiv + 64).next_power_of_two();
+        let np = loop {
+            let mask = cap - 1;
+            let lim = (cap / 4 * 3) as u32;
+            acc.map.clear();
+            acc.map.resize(cap, (0u64, u32::MAX));
+            acc.pidx.clear();
+            acc.pidx.reserve(nb_ev);
+            acc.cnt.clear();
+            acc.pnames.clear();
+            keys.clear();
+            let mut np: u32 = 0;
+            let mut ok = true;
+            let npart = ev_parts.len();
+            'parts: for (ci, p) in ev_parts.iter().enumerate() {
+                // software prefetch across parts: offsets 4 parts ahead, slice heads 2 parts ahead
+                // (each part's slice is a random jump the hardware prefetcher cannot follow)
+                unsafe {
+                    use core::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                    if ci + 4 < npart { _mm_prefetch(ev_parts.get_unchecked(ci + 4).evs.1.as_ptr().add(b) as *const i8, _MM_HINT_T0); }
+                    if ci + 2 < npart {
+                        let p2 = ev_parts.get_unchecked(ci + 2);
+                        let h = p2.evs.0.ptr.add(*p2.evs.1.get_unchecked(b) as usize) as *const i8;
+                        _mm_prefetch(h, _MM_HINT_T0); _mm_prefetch(h.add(64), _MM_HINT_T0); _mm_prefetch(h.add(128), _MM_HINT_T0); _mm_prefetch(h.add(192), _MM_HINT_T0);
+                    }
+                }
+                let (v, off) = &p.evs;
+                let crid = (ci as u32) << lbits;
+                for ep in &v[off[b] as usize..off[b + 1] as usize] {
+                    if ep.ts == u32::MAX { continue; }
+                    let pk = (ep.pk_lo as u64) | ((ep.pk_hi as u64) << 32);
+                    let mut q = (pk as usize) & mask;
                     let id = loop {
                         let m = unsafe { acc.map.get_unchecked_mut(q) };
-                        if m.1 == u32::MAX { *m = (e.pk, np); np += 1; acc.cnt.push(0); break m.1; }
-                        if m.0 == e.pk { break m.1; }
+                        if m.1 == u32::MAX {
+                            if np >= lim { ok = false; break 'parts; }
+                            *m = (pk, np); np += 1; acc.cnt.push(0);
+                            // first event of this person in gather order: (name, rid) for the output name
+                            acc.pnames.push(((ep.name as u64) << 32) | (crid as u64));
+                            break m.1;
+                        }
+                        if m.0 == pk { break m.1; }
                         q = (q + 1) & mask;
                     };
+                    keys.push(((ep.ts as u64) << 32) | (ep.pc as u64));
                     acc.pidx.push(id);
                     unsafe { *acc.cnt.get_unchecked_mut(id as usize) += 1; }
                 }
             }
-        }
-        if !grouping {
+            if ok { break np; }
             T_REGROUP.fetch_add(1, Relaxed);
-            let cap = (evs.len() * 2 + 64).next_power_of_two();
-            mask = cap - 1; lim = u32::MAX; let _ = lim;
-            acc.map.clear(); acc.map.resize(cap, (0u64, u32::MAX));
-            acc.pidx.clear(); acc.cnt.clear(); np = 0;
-            for e in evs.iter() {
-                let mut q = (e.pk as usize) & mask;
-                let id = loop {
-                    let m = unsafe { acc.map.get_unchecked_mut(q) };
-                    if m.1 == u32::MAX { *m = (e.pk, np); np += 1; acc.cnt.push(0); break m.1; }
-                    if m.0 == e.pk { break m.1; }
-                    q = (q + 1) & mask;
-                };
-                acc.pidx.push(id);
-                unsafe { *acc.cnt.get_unchecked_mut(id as usize) += 1; }
-            }
-        }
+            cap = (nb_ev * 2 + 64).next_power_of_two();
+        };
         acc.np = np;
-        T_NP.fetch_add(np as u64, Relaxed); T_NEV.fetch_add(evs.len() as u64, Relaxed);
+        T_NP.fetch_add(np as u64, Relaxed); T_NEV.fetch_add(keys.len() as u64, Relaxed);
         cls.clear();
+        cls.reserve(cl_parts.iter().map(|p| (p.1[b + 1] - p.1[b]) as usize).sum());
         for (v, off) in &cl_parts { cls.extend_from_slice(&v[off[b] as usize..off[b + 1] as usize]); }
         T_GATHER.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
-        process_bucket(&ctx, &mut evs, &mut cls, acc);
-        acc.evbuf = evs;
+        process_bucket(&ctx, &keys, &mut cls, acc);
+        acc.kbuf = keys;
         acc.clbuf = cls;
     });
     let accs: Vec<Acc> = slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
