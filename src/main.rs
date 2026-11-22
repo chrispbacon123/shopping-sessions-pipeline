@@ -610,15 +610,87 @@ fn for_records_old<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
     }
 }
 
-fn scatter_b<T: Copy>(v: &[T], bk: &[u16]) -> (Vec<T>, Vec<u32>) {
+
+// ---------- output arena: bump-allocated scatter outputs, pre-faulted ahead by a helper thread ----------
+// Every event scatter output (EvP, KeyRec) is fresh memory that the kernel must zero on first touch
+// (THP clear_page was ~13% of CPU). The helper faults pages in just ahead of the bump pointer, so
+// the zeroing runs on an otherwise idle CPU while workers wait on cold I/O. Pages are never freed
+// (process exits). ARENA=0 disables (plain Vecs, old behaviour).
+mod arena {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+    static BASE: AtomicUsize = AtomicUsize::new(0);
+    static CAP: AtomicUsize = AtomicUsize::new(0);
+    static BUMP: AtomicUsize = AtomicUsize::new(0);
+    pub static STOP: AtomicBool = AtomicBool::new(false);
+    const STEP: usize = 2 << 20;
+    pub fn init(bytes: usize, lead: usize) {
+        let bytes = (bytes + STEP - 1) & !(STEP - 1);
+        unsafe {
+            let p = libc::mmap(std::ptr::null_mut(), bytes + STEP, libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE, -1, 0);
+            if p == libc::MAP_FAILED { return; }
+            let b = (p as usize + STEP - 1) & !(STEP - 1);
+            libc::madvise(b as *mut libc::c_void, bytes, libc::MADV_HUGEPAGE);
+            CAP.store(bytes, Relaxed);
+            BASE.store(b, Relaxed);
+        }
+        if lead == 0 { return; }
+        std::thread::spawn(move || {
+            let (b, cap) = (BASE.load(Relaxed), CAP.load(Relaxed));
+            let mut t = 0usize;
+            let mut populate = true;
+            while t < cap && !STOP.load(Relaxed) {
+                let u = BUMP.load(Relaxed);
+                // never fault pages workers already own (they fault those themselves)
+                if t < u { t = (u + STEP - 1) & !(STEP - 1); continue; }
+                if t >= u + lead { std::thread::sleep(std::time::Duration::from_micros(100)); continue; }
+                let n = STEP.min(cap - t);
+                if populate {
+                    // MADV_POPULATE_WRITE (23, Linux 5.14+): fault in writable without touching contents
+                    if unsafe { libc::madvise((b + t) as *mut libc::c_void, n, 23) } != 0 { populate = false; continue; }
+                } else {
+                    // fallback: atomic +0 per 4 KB page is safe against concurrent worker writes
+                    let mut o = 0;
+                    while o < n { unsafe { (*((b + t + o) as *const std::sync::atomic::AtomicU8)).fetch_add(0, Relaxed); } o += 4096; }
+                }
+                t += n;
+            }
+        });
+    }
+    /// Uninitialized room for n Ts (caller writes all of them); None when the arena is off or full.
+    pub fn alloc<T>(n: usize) -> Option<*mut T> {
+        let base = BASE.load(Relaxed);
+        if base == 0 { return None; }
+        let sz = (n * std::mem::size_of::<T>() + 63) & !63;
+        let o = BUMP.fetch_add(sz, Relaxed);
+        if o + sz > CAP.load(Relaxed) { return None; }
+        Some((base + o) as *mut T)
+    }
+}
+/// Output buffer: arena slice (never freed) or an owned Vec.
+struct OutBuf<T> { ptr: *mut T, len: usize, _own: Vec<T> }
+unsafe impl<T: Send> Send for OutBuf<T> {}
+unsafe impl<T: Sync> Sync for OutBuf<T> {}
+impl<T> OutBuf<T> {
+    fn uninit(n: usize) -> Self {
+        match arena::alloc::<T>(n) {
+            Some(p) => OutBuf { ptr: p, len: n, _own: Vec::new() },
+            None => { let mut v = Vec::with_capacity(n); let p = v.as_mut_ptr(); OutBuf { ptr: p, len: n, _own: v } }
+        }
+    }
+    fn empty() -> Self { let mut v = Vec::new(); OutBuf { ptr: v.as_mut_ptr(), len: 0, _own: v } }
+}
+impl<T> std::ops::Deref for OutBuf<T> { type Target = [T]; fn deref(&self) -> &[T] { unsafe { std::slice::from_raw_parts(self.ptr, self.len) } } }
+impl<T> std::ops::DerefMut for OutBuf<T> { fn deref_mut(&mut self) -> &mut [T] { unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) } } }
+
+fn scatter_b<T: Copy>(v: &[T], bk: &[u16]) -> (OutBuf<T>, Vec<u32>) {
     let mut cnt = vec![0u32; NB + 1];
     for &b in bk { cnt[b as usize + 1] += 1; }
     for i in 0..NB { cnt[i + 1] += cnt[i]; }
     let mut pos = cnt.clone();
-    let mut out: Vec<T> = Vec::with_capacity(v.len());
+    let out = OutBuf::<T>::uninit(v.len());
     unsafe {
-        out.set_len(v.len());
-        let p = out.as_mut_ptr();
+        let p = out.ptr;
         for (x, &b) in v.iter().zip(bk) { let b = b as usize; *p.add(pos[b] as usize) = *x; pos[b] += 1; }
     }
     (out, cnt)
@@ -649,16 +721,15 @@ struct Ev { pk: u64, ts: u32, rid: u32, pc: u32, name: u32 } // pc = price | cat
 struct EvP { pk_lo: u32, pk_hi: u32, ts: u32, pc: u32, name: u32 }
 const NO_EV: u32 = u32::MAX;
 /// Counting-sort scatter of raw events into NB person buckets as 20-byte EvP; perm[i] = output slot of v[i].
-fn scatter_ev(v: &[Ev], perm: &mut Vec<u32>) -> (Vec<EvP>, Vec<u32>) {
+fn scatter_ev(v: &[Ev], perm: &mut Vec<u32>) -> (OutBuf<EvP>, Vec<u32>) {
     let mut cnt = vec![0u32; NB + 1];
     for x in v { cnt[bucket(x.pk) + 1] += 1; }
     for i in 0..NB { cnt[i + 1] += cnt[i]; }
     let mut pos = cnt.clone();
     perm.clear(); perm.reserve(v.len());
-    let mut out: Vec<EvP> = Vec::with_capacity(v.len());
+    let out = OutBuf::<EvP>::uninit(v.len());
     unsafe {
-        out.set_len(v.len());
-        let p = out.as_mut_ptr();
+        let p = out.ptr;
         for x in v {
             let b = bucket(x.pk);
             let o = pos[b];
@@ -675,8 +746,10 @@ struct Cl { pk: u64, cid: u64, ts: u32, camp: u16 }
 struct URow { name: u64, day: i32, sessions: u32, events: u32, rev: u64, top: i32 }
 
 // ---------- people: concurrent open-addressing table + lock-free union-find ----------
-struct Slot { key: AtomicU64, pk: AtomicU64, off: AtomicU64 }
-struct People { slots: Vec<Slot>, mask: usize }
+/// 16-byte slot (4 per cache line) for the hot event/click resolve probe; name offsets live in `offs`.
+#[repr(C, align(16))]
+struct Slot { key: AtomicU64, pk: AtomicU64 }
+struct People { slots: Vec<Slot>, offs: Vec<AtomicU64>, mask: usize }
 
 fn zeroed_vec<T>(n: usize) -> Vec<T> {
     // T must be valid when all-zero (atomics of ints)
@@ -705,7 +778,7 @@ impl People {
             if k == h { return i as u32; }
             if k == 0 {
                 match s.key.compare_exchange(0, h, Relaxed, Relaxed) {
-                    Ok(_) => { s.off.store(off, Relaxed); return i as u32; }
+                    Ok(_) => { self.offs[i].store(off, Relaxed); return i as u32; }
                     Err(k2) => if k2 == h { return i as u32; },
                 }
             }
@@ -756,7 +829,7 @@ impl People {
         loop {
             let s = &self.slots[i];
             let k = s.key.load(Relaxed);
-            if k == h { return Some((s.pk.load(Relaxed), s.off.load(Relaxed))); }
+            if k == h { return Some((s.pk.load(Relaxed), self.offs[i].load(Relaxed))); }
             if k == 0 { return None; }
             i = (i + 1) & self.mask;
         }
@@ -778,7 +851,7 @@ fn build_people(link_fis: &[usize]) -> People {
     tl("s1");
     let total: usize = pairs.iter().map(|v| v.len()).sum();
     let cap = (total * 2 + 16).next_power_of_two(); // distinct IDs <= 2*pairs, so the table never fills
-    let ppl = People { slots: zeroed_vec(cap), mask: cap - 1 };
+    let ppl = People { slots: zeroed_vec(cap), offs: zeroed_vec(cap), mask: cap - 1 };
     let parent: Vec<AtomicU32> = zeroed_vec(cap); // 0 = root, else parent+1
     if vb { eprintln!("      pairs {} cap {}", total, cap); }
     tl("alloc");
@@ -816,7 +889,7 @@ fn build_people(link_fis: &[usize]) -> People {
     (0..cap).into_par_iter().with_min_len(4096).for_each(|i| {
         if !used(i) { return; }
         let r = find(i as u32) as usize;
-        let my = ppl.slots[i].off.load(Relaxed);
+        let my = ppl.offs[i].load(Relaxed);
         let best = &ppl.slots[r].pk;
         let mut cur = best.load(Relaxed);
         loop {
@@ -829,7 +902,7 @@ fn build_people(link_fis: &[usize]) -> People {
         if !used(i) || parent[i].load(Relaxed) != 0 { return; }
         let s = &ppl.slots[i];
         let off = s.pk.load(Relaxed) - 1;
-        s.off.store(off, Relaxed);
+        ppl.offs[i].store(off, Relaxed);
         s.pk.store(hs(field_at(off)), Relaxed);
     });
     tl("s4");
@@ -837,7 +910,7 @@ fn build_people(link_fis: &[usize]) -> People {
         if !used(i) || parent[i].load(Relaxed) == 0 { return; }
         let r = find(i as u32) as usize;
         let s = &ppl.slots[i];
-        s.off.store(ppl.slots[r].off.load(Relaxed), Relaxed);
+        ppl.offs[i].store(ppl.offs[r].load(Relaxed), Relaxed);
         s.pk.store(ppl.slots[r].pk.load(Relaxed), Relaxed);
     });
     tl("s5");
@@ -849,17 +922,71 @@ struct Ctx<'a> { base: i64, ndays: usize, ws_day: i64, ncamp: usize, ncat: usize
 impl<'a> Ctx<'a> {
     #[inline]
     fn resolve_name(&self, name: u32, rid: u32) -> u64 {
-        if name >> 31 == 1 { self.people.slots[(name & 0x7FFF_FFFF) as usize].off.load(Relaxed) }
+        if name >> 31 == 1 { self.people.offs[(name & 0x7FFF_FFFF) as usize].load(Relaxed) }
         else { let c = &self.ech[(rid >> self.lbits) as usize]; ((c.fi as u64) << 40) | (c.start as u64 + name as u64) }
     }
 }
 
-struct Acc { camp: Vec<[u64; 4]>, asst: Vec<u32>, evbuf: Vec<Ev>, clbuf: Vec<Cl>, rows: Vec<URow>, catsum: Vec<u64>, starts: Vec<u32>, sdays: Vec<u32>, tmp: Vec<(u16, u32)>,
-    map: Vec<(u64, u32)>, np: u32, pidx: Vec<u32>, cnt: Vec<u32>, estart: Vec<u32>, cstart: Vec<u32>, cpid: Vec<u32>, evs: Vec<Ev>, cls: Vec<Cl>, ord: Vec<u64> }
+struct Acc { camp: Vec<[u64; 4]>, asst: Vec<u32>, evbuf: Vec<Ev>, clbuf: Vec<Cl>, rows: Vec<URow>, catsum: Vec<u64>, starts: Vec<u32>, sdays: Vec<u32>, tmp: Vec<u64>,
+    map: Vec<(u64, u32)>, np: u32, pidx: Vec<u32>, cnt: Vec<u32>, estart: Vec<u32>, cstart: Vec<u32>, cpid: Vec<u32>, evs: Vec<Ev>, cls: Vec<Cl>, ord: Vec<u64>, pnames: Vec<u64> }
 impl Acc {
     fn new(c: &Ctx<'_>) -> Self {
         Acc { camp: vec![[0; 4]; (c.ncamp + 1) * c.ndays], asst: vec![0; (c.ncamp + 1) * c.ndays], evbuf: Vec::new(), clbuf: Vec::new(), rows: Vec::new(), catsum: vec![0; c.ncat], starts: Vec::new(), sdays: Vec::new(), tmp: Vec::new(),
-            map: Vec::new(), np: 0, pidx: Vec::new(), cnt: Vec::new(), estart: Vec::new(), cstart: Vec::new(), cpid: Vec::new(), evs: Vec::new(), cls: Vec::new(), ord: Vec::new() }
+            map: Vec::new(), np: 0, pidx: Vec::new(), cnt: Vec::new(), estart: Vec::new(), cstart: Vec::new(), cpid: Vec::new(), evs: Vec::new(), cls: Vec::new(), ord: Vec::new(), pnames: Vec::new() }
+    }
+}
+
+#[derive(Default)]
+struct DedupScratch { a: Vec<KeyRec>, b: Vec<KeyRec>, cnt: Vec<u32>, tab: Vec<u32> }
+
+/// Dedup one event_id bucket. `runs` = the bucket's KeyRec slices in chunk order. Calls `mark(rid)` on
+/// every losing copy: per event id the first copy with the smallest ingest wins (same rule and visit
+/// order as one bucket-wide table). The bucket is first split stably by the top bits of `eh` into
+/// sub-buckets of <= ~8K records so each probe table (u32 indices, 32 KB-128 KB) stays in L1/L2.
+fn dedup_bucket(runs: &[&[KeyRec]], sc: &mut DedupScratch, mark: &impl Fn(u32)) {
+    static SUBN_L: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| std::env::var("DD_SUBN").ok().and_then(|v| v.parse().ok()).unwrap_or(8192usize).max(256));
+    #[allow(non_snake_case)] let SUBN: usize = *SUBN_L;
+    let total: usize = runs.iter().map(|r| r.len()).sum();
+    if total == 0 { return; }
+    let sbits = total.div_ceil(SUBN).next_power_of_two().trailing_zeros();
+    let ns = 1usize << sbits;
+    let sub = |eh: u64| if sbits == 0 { 0 } else { (eh >> (64 - sbits)) as usize };
+    sc.cnt.clear(); sc.cnt.resize(ns + 1, 0);
+    sc.a.clear(); sc.a.reserve(total);
+    for r in runs { sc.a.extend_from_slice(r); }
+    let seg_all: &[KeyRec] = if ns == 1 { sc.cnt[1] = total as u32; &sc.a } else {
+        for r in &sc.a { sc.cnt[sub(r.eh) + 1] += 1; }
+        for i in 0..ns { sc.cnt[i + 1] += sc.cnt[i]; }
+        let mut pos: [u32; 64] = [0; 64];
+        let mut posv: Vec<u32>;
+        let pos: &mut [u32] = if ns <= 64 { pos[..ns].copy_from_slice(&sc.cnt[..ns]); &mut pos[..ns] } else { posv = sc.cnt[..ns].to_vec(); &mut posv };
+        sc.b.clear(); sc.b.reserve(total);
+        unsafe {
+            sc.b.set_len(total);
+            let p = sc.b.as_mut_ptr();
+            for r in &sc.a { let s = sub(r.eh); *p.add(pos[s] as usize) = *r; pos[s] += 1; }
+        }
+        &sc.b
+    };
+    for s in 0..ns {
+        let seg = &seg_all[sc.cnt[s] as usize..sc.cnt[s + 1] as usize];
+        let cap = (seg.len() * 2 + 16).next_power_of_two();
+        let mask = cap - 1;
+        sc.tab.clear(); sc.tab.resize(cap, u32::MAX);
+        let tab = &mut sc.tab[..];
+        for (k, r) in seg.iter().enumerate() {
+            let mut q = r.eh as usize & mask;
+            loop {
+                let e = tab[q];
+                if e == u32::MAX { tab[q] = k as u32; break; }
+                let cur = unsafe { seg.get_unchecked(e as usize) };
+                if cur.eh == r.eh {
+                    if r.ingest < cur.ingest { mark(cur.rid); tab[q] = k as u32; } else { mark(r.rid); }
+                    break;
+                }
+                q = (q + 1) & mask;
+            }
+        }
     }
 }
 
@@ -870,19 +997,26 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
     let np = acc.np;
     let mask = acc.map.len() - 1;
     let npu = np as usize;
-    // prefix
+    // prefix sums for event scatter
     acc.estart.clear(); acc.estart.reserve(npu + 1);
     let mut run = 0u32;
     for &k in acc.cnt.iter() { acc.estart.push(run); run += k; }
     acc.estart.push(run);
-    acc.evs.clear(); acc.evs.reserve(n_in);
-    unsafe { acc.evs.set_len(n_in); }
+    // Scatter packed (ts<<32|pc) directly to acc.ord, store first event's (name, rid) per person
+    acc.ord.clear(); acc.ord.reserve(n_in);
+    unsafe { acc.ord.set_len(n_in); }
+    acc.pnames.clear(); acc.pnames.resize(npu, 0);
     {
         let mut pos: Vec<u32> = acc.estart[..npu].to_vec();
         for (e, &id) in evs_in.iter().zip(acc.pidx.iter()) {
-            let p = &mut pos[id as usize];
-            acc.evs[*p as usize] = *e;
-            *p += 1;
+            let idu = id as usize;
+            let p = pos[idu];
+            // First event for this person: store (name<<32|rid)
+            if p == acc.estart[idu] {
+                acc.pnames[idu] = ((e.name as u64) << 32) | (e.rid as u64);
+            }
+            acc.ord[p as usize] = ((e.ts as u64) << 32) | (e.pc as u64);
+            pos[idu] = p + 1;
         }
     }
     // clicks: only persons with events matter
@@ -900,7 +1034,7 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
         if id != u32::MAX { acc.cnt[id as usize] += 1; }
     }
     acc.cstart.clear(); acc.cstart.reserve(npu + 1);
-    let mut run = 0u32;
+    run = 0;
     for &k in acc.cnt.iter() { acc.cstart.push(run); run += k; }
     acc.cstart.push(run);
     let ncl = run as usize;
@@ -915,6 +1049,28 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
             *p += 1;
         }
     }
+    // Sort packed u64s in place: insertion sort for tiny groups, pdqsort otherwise
+    for pi in 0..npu {
+        let (i, i1) = (acc.estart[pi] as usize, acc.estart[pi + 1] as usize);
+        let len = i1 - i;
+        if len > 1 {
+            let slice = &mut acc.ord[i..i1];
+            if len <= 16 {
+                // Insertion sort for tiny groups
+                for j in 1..len {
+                    let key = slice[j];
+                    let mut k = j;
+                    while k > 0 && slice[k - 1] > key {
+                        slice[k] = slice[k - 1];
+                        k -= 1;
+                    }
+                    slice[k] = key;
+                }
+            } else {
+                slice.sort_unstable();
+            }
+        }
+    }
     T_SORT.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     let t1 = Instant::now();
     struct D(Instant); impl Drop for D { fn drop(&mut self) { T_PROC.fetch_add(self.0.elapsed().as_nanos() as u64, Relaxed); } }
@@ -922,7 +1078,6 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
     let nd = c.ndays;
     let organic = c.ncamp;
     let day0 = c.ws_day;
-    let mut evs = std::mem::take(&mut acc.evs);
     let mut cls = std::mem::take(&mut acc.cls);
     for pi in 0..npu {
         let (i, i1) = (acc.estart[pi] as usize, acc.estart[pi + 1] as usize);
@@ -930,13 +1085,9 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
         if j1 - j > 1 {
             cls[j..j1].sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| if a.cid == b.cid { std::cmp::Ordering::Equal } else { field_at(b.cid).cmp(field_at(a.cid)) }));
         }
-        let name = c.resolve_name(evs[i].name, evs[i].rid);
-        let pe = &evs[i..i1];
-        // sort (ts, index) u64 keys instead of moving 24-byte records
-        acc.ord.clear();
-        acc.ord.extend(pe.iter().enumerate().map(|(k, e)| ((e.ts as u64) << 32) | k as u64));
-        acc.ord.sort_unstable();
-        let ord = std::mem::take(&mut acc.ord);
+        let pn = acc.pnames[pi];
+        let name = c.resolve_name((pn >> 32) as u32, pn as u32);
+        let packed = &acc.ord[i..i1];
         let pc = &cls[j..j1];
         acc.starts.clear();
         acc.sdays.clear();
@@ -971,12 +1122,14 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
                 acc.rows.push(URow { name, day: cur_day as i32, sessions: d_sess, events: d_ev, rev: d_rev, top });
             }
         }}}
-        for &ok in ord.iter() {
-            let e = unsafe { pe.get_unchecked((ok & 0xFFFF_FFFF) as usize) };
-            if first || e.ts - prev_ts > 1_800_000 {
+        // Process events in timestamp order - packed (ts<<32|pc) values are sorted
+        for &pk in packed {
+            let ts = (pk >> 32) as u32;
+            let pc = pk as u32;
+            if first || ts - prev_ts > 1_800_000 {
                 if !first { close_session!(); }
                 first = false;
-                s_start = e.ts;
+                s_start = ts;
                 s_rev = 0;
                 s_purch = false;
                 let day = (c.base + s_start as i64).div_euclid(DAY);
@@ -990,48 +1143,47 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
                 }
                 d_sess += 1;
             }
-            prev_ts = e.ts;
+            prev_ts = ts;
             d_ev += 1;
-            let price = e.pc & 0xFF_FFFF;
+            let price = pc & 0xFF_FFFF;
             if price > 0 {
                 let p = price as u64;
                 s_rev += p; s_purch = true;
                 d_rev += p; d_purch = true;
-                acc.catsum[(e.pc >> 24) as usize] += p;
+                acc.catsum[(pc >> 24) as usize] += p;
             }
         }
         close_session!();
         flush_day!();
-        acc.ord = ord;
         if !pc.is_empty() {
+            // Assists: pack (camp, ts) into u64 for faster sort on a single primitive
             acc.tmp.clear();
-            acc.tmp.extend(pc.iter().map(|x| (x.camp, x.ts)));
+            acc.tmp.extend(pc.iter().map(|x| ((x.camp as u64) << 32) | (x.ts as u64)));
             acc.tmp.sort_unstable();
             let t = &acc.tmp;
             let starts = &acc.starts;
             let mut k = 0;
             while k < t.len() {
-                let camp = t[k].0;
-                let mut a = t[k].1;
+                let camp = (t[k] >> 32) as u16;
+                let mut a = t[k] as u32;
                 let mut e = a + WEEKU;
                 k += 1;
                 loop {
-                    let more = k < t.len() && t[k].0 == camp;
-                    if more && t[k].1 <= e { e = t[k].1 + WEEKU; k += 1; continue; }
+                    let more = k < t.len() && (t[k] >> 32) as u16 == camp;
+                    if more && (t[k] as u32) <= e { e = (t[k] as u32) + WEEKU; k += 1; continue; }
                     let mut lo = starts.partition_point(|&s| s < a);
                     while lo < starts.len() && starts[lo] <= e {
                         acc.asst[camp as usize * nd + acc.sdays[lo] as usize] += 1;
                         lo += 1;
                     }
                     if !more { break; }
-                    a = t[k].1;
+                    a = t[k] as u32;
                     e = a + WEEKU;
                     k += 1;
                 }
             }
         }
     }
-    acc.evs = evs;
     acc.cls = cls;
 }
 
@@ -1113,6 +1265,15 @@ fn main() {
             }
         }
     });
+    if std::env::var("ARENA").map_or(true, |v| v != "0") {
+        // EvP+KeyRec <= 36 B per event line; lines are >= ~40 B
+        let fl = files();
+        let evb: usize = fl[2 + ln_p.len() + cl_p.len()..].iter().map(|f| f.len()).sum();
+        let clb: usize = fl[2 + ln_p.len()..2 + ln_p.len() + cl_p.len()].iter().map(|f| f.len()).sum();
+        let lead = std::env::var("ARENA_LEAD_MB").ok().and_then(|v| v.parse().ok()).unwrap_or(96usize) << 20;
+        let _ = clb;
+        arena::init(evb + (64 << 20), lead);
+    }
     let ln_fis: Vec<usize> = (2..2 + ln_p.len()).collect();
     let cl_fis: Vec<usize> = (2 + ln_p.len()..2 + ln_p.len() + cl_p.len()).collect();
     let ev_fis: Vec<usize> = (2 + ln_p.len() + cl_p.len()..all.len()).collect();
@@ -1159,7 +1320,7 @@ fn main() {
     let cbits = (usize::BITS - ech.len().max(2).next_power_of_two().leading_zeros() - 1).max(1);
     let lbits = 32 - cbits;
     let lmask: u32 = (1u32 << lbits) - 1;
-    struct EvPart { keys: (Vec<KeyRec>, Vec<u32>), evs: (Vec<EvP>, Vec<u32>) }
+    struct EvPart { keys: (OutBuf<KeyRec>, Vec<u32>), evs: (OutBuf<EvP>, Vec<u32>) }
     let cws = ws - WEEK;
     let cch = chunks(&cl_fis, 4 << 20);
     let ev_job = |kb: &mut Vec<KeyRec>, eb: &mut Vec<Ev>, kbk: &mut Vec<u16>, perm: &mut Vec<u32>, ci: usize, c: &Chunk| -> EvPart {
@@ -1240,6 +1401,7 @@ fn main() {
     });
     let mut ev_parts: Vec<EvPart> = ev_slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
     let cl_parts: Vec<(Vec<Cl>, Vec<u32>)> = cl_slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
+    arena::STOP.store(true, Relaxed);
     lap("events + clicks parsed");
 
     // Phase 3: dedup on event_id -> loser bitmap
@@ -1252,6 +1414,8 @@ fn main() {
         let p = evptr[(rid >> lbits) as usize] as *mut EvP;
         unsafe { (*p.add((rid & lmask) as usize)).ts = u32::MAX; }
     };
+    let dd_old = std::env::var_os("DEDUP_OLD").is_some();
+    if dd_old {
     (0..NB).into_par_iter().for_each_init(
         || Vec::<(u64, *const KeyRec)>::new(),
         |table, b| {
@@ -1278,8 +1442,16 @@ fn main() {
                 }
             }
         });
+    } else {
+    (0..NB).into_par_iter().for_each_init(
+        || DedupScratch::default(),
+        |sc, b| {
+            let runs: Vec<&[KeyRec]> = ev_parts.iter().map(|p| &p.keys.0[p.keys.1[b] as usize..p.keys.1[b + 1] as usize]).collect();
+            dedup_bucket(&runs, sc, &mark);
+        });
+    }
     lap("events deduped");
-    for p in ev_parts.iter_mut() { p.keys = (Vec::new(), Vec::new()); }
+    for p in ev_parts.iter_mut() { p.keys = (OutBuf::empty(), Vec::new()); }
     let ctx = Ctx { base, ndays, ws_day, ncamp: camps.len(), ncat: cats.len(), people: &people, ech: &ech, lbits };
     assert!(cats.len() < 256);
 
