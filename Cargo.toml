@@ -3,6 +3,14 @@ name = "shopping_sessions"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "shopping_sessions"
+path = "src/main.rs"
+
+[[bin]]
+name = "bandwidth_exp"
+path = "src/bandwidth_exp.rs"
+
 [dependencies]
 memmap2 = "0.9"
 memchr = "2"
