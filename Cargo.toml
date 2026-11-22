@@ -11,6 +11,14 @@ path = "src/main.rs"
 name = "bandwidth_exp"
 path = "src/bandwidth_exp.rs"
 
+[[bin]]
+name = "compare_parsers"
+path = "src/compare_parsers.rs"
+
+[[bin]]
+name = "bench_ts"
+path = "src/bench_ts.rs"
+
 [dependencies]
 memmap2 = "0.9"
 memchr = "2"
