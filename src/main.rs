@@ -875,11 +875,11 @@ impl<'a> Ctx<'a> {
 }
 
 struct Acc { camp: Vec<[u64; 4]>, asst: Vec<u32>, evbuf: Vec<Ev>, clbuf: Vec<Cl>, rows: Vec<URow>, catsum: Vec<u64>, starts: Vec<u32>, sdays: Vec<u32>, tmp: Vec<u64>,
-    map: Vec<(u64, u32)>, np: u32, pidx: Vec<u32>, cnt: Vec<u32>, estart: Vec<u32>, cstart: Vec<u32>, cpid: Vec<u32>, evs: Vec<Ev>, cls: Vec<Cl>, ord: Vec<u64> }
+    map: Vec<(u64, u32)>, np: u32, pidx: Vec<u32>, cnt: Vec<u32>, estart: Vec<u32>, cstart: Vec<u32>, cpid: Vec<u32>, evs: Vec<Ev>, cls: Vec<Cl>, ord: Vec<u64>, pnames: Vec<u64> }
 impl Acc {
     fn new(c: &Ctx<'_>) -> Self {
         Acc { camp: vec![[0; 4]; (c.ncamp + 1) * c.ndays], asst: vec![0; (c.ncamp + 1) * c.ndays], evbuf: Vec::new(), clbuf: Vec::new(), rows: Vec::new(), catsum: vec![0; c.ncat], starts: Vec::new(), sdays: Vec::new(), tmp: Vec::new(),
-            map: Vec::new(), np: 0, pidx: Vec::new(), cnt: Vec::new(), estart: Vec::new(), cstart: Vec::new(), cpid: Vec::new(), evs: Vec::new(), cls: Vec::new(), ord: Vec::new() }
+            map: Vec::new(), np: 0, pidx: Vec::new(), cnt: Vec::new(), estart: Vec::new(), cstart: Vec::new(), cpid: Vec::new(), evs: Vec::new(), cls: Vec::new(), ord: Vec::new(), pnames: Vec::new() }
     }
 }
 
@@ -890,19 +890,26 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
     let np = acc.np;
     let mask = acc.map.len() - 1;
     let npu = np as usize;
-    // prefix
+    // prefix sums for event scatter
     acc.estart.clear(); acc.estart.reserve(npu + 1);
     let mut run = 0u32;
     for &k in acc.cnt.iter() { acc.estart.push(run); run += k; }
     acc.estart.push(run);
-    acc.evs.clear(); acc.evs.reserve(n_in);
-    unsafe { acc.evs.set_len(n_in); }
+    // Scatter packed (ts<<32|pc) directly to acc.ord, store first event's (name, rid) per person
+    acc.ord.clear(); acc.ord.reserve(n_in);
+    unsafe { acc.ord.set_len(n_in); }
+    acc.pnames.clear(); acc.pnames.resize(npu, 0);
     {
         let mut pos: Vec<u32> = acc.estart[..npu].to_vec();
         for (e, &id) in evs_in.iter().zip(acc.pidx.iter()) {
-            let p = &mut pos[id as usize];
-            acc.evs[*p as usize] = *e;
-            *p += 1;
+            let idu = id as usize;
+            let p = pos[idu];
+            // First event for this person: store (name<<32|rid)
+            if p == acc.estart[idu] {
+                acc.pnames[idu] = ((e.name as u64) << 32) | (e.rid as u64);
+            }
+            acc.ord[p as usize] = ((e.ts as u64) << 32) | (e.pc as u64);
+            pos[idu] = p + 1;
         }
     }
     // clicks: only persons with events matter
@@ -920,7 +927,7 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
         if id != u32::MAX { acc.cnt[id as usize] += 1; }
     }
     acc.cstart.clear(); acc.cstart.reserve(npu + 1);
-    let mut run = 0u32;
+    run = 0;
     for &k in acc.cnt.iter() { acc.cstart.push(run); run += k; }
     acc.cstart.push(run);
     let ncl = run as usize;
@@ -935,19 +942,27 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
             *p += 1;
         }
     }
-    // Build packed (ts<<32|pc) keys for all events, sort by person
-    // This gives 8-byte sorted entries that we can iterate sequentially
-    acc.ord.clear();
-    acc.ord.reserve(n_in);
+    // Sort packed u64s in place: insertion sort for tiny groups, pdqsort otherwise
     for pi in 0..npu {
         let (i, i1) = (acc.estart[pi] as usize, acc.estart[pi + 1] as usize);
-        for e in &acc.evs[i..i1] {
-            acc.ord.push(((e.ts as u64) << 32) | (e.pc as u64));
+        let len = i1 - i;
+        if len > 1 {
+            let slice = &mut acc.ord[i..i1];
+            if len <= 16 {
+                // Insertion sort for tiny groups
+                for j in 1..len {
+                    let key = slice[j];
+                    let mut k = j;
+                    while k > 0 && slice[k - 1] > key {
+                        slice[k] = slice[k - 1];
+                        k -= 1;
+                    }
+                    slice[k] = key;
+                }
+            } else {
+                slice.sort_unstable();
+            }
         }
-    }
-    for pi in 0..npu {
-        let (i, i1) = (acc.estart[pi] as usize, acc.estart[pi + 1] as usize);
-        if i1 > i + 1 { acc.ord[i..i1].sort_unstable(); }
     }
     T_SORT.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
     let t1 = Instant::now();
@@ -963,7 +978,8 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
         if j1 - j > 1 {
             cls[j..j1].sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| if a.cid == b.cid { std::cmp::Ordering::Equal } else { field_at(b.cid).cmp(field_at(a.cid)) }));
         }
-        let name = c.resolve_name(acc.evs[i].name, acc.evs[i].rid);
+        let pn = acc.pnames[pi];
+        let name = c.resolve_name((pn >> 32) as u32, pn as u32);
         let packed = &acc.ord[i..i1];
         let pc = &cls[j..j1];
         acc.starts.clear();
