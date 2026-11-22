@@ -60,6 +60,23 @@ fn prefetch_field(off: u64) {
 
 #[inline(always)]
 fn hs(b: &[u8]) -> u64 { let h = xxh3_64(b); if h == 0 { 1 } else { h } }
+static PFB: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+fn pfb_blocks() -> usize { *PFB.get_or_init(|| std::env::var("PFB").ok().and_then(|v| v.parse().ok()).unwrap_or(128)) }
+static EID128: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+fn eid128() -> bool { *EID128.get_or_init(|| std::env::var("EID128").map_or(false, |v| v != "0")) }
+/// NBBITS-bit bucket from CRC32C over the bytes (8 at a time, then the tail), independent of xxh3.
+#[inline(always)]
+fn crc_bucket(b: &[u8]) -> usize {
+    use core::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+    let mut c: u64 = 0x9E37_79B9;
+    let mut i = 0;
+    unsafe {
+        while i + 8 <= b.len() { c = _mm_crc32_u64(c, (b.as_ptr().add(i) as *const u64).read_unaligned()); i += 8; }
+        while i < b.len() { c = _mm_crc32_u8(c as u32, *b.get_unchecked(i)) as u64; i += 1; }
+    }
+    // mix the length in and take the top bits of a multiply (crc low bits are linear in the input)
+    (((c ^ ((b.len() as u64) << 32)).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> (64 - NBBITS)) as usize
+}
 static PINS: AtomicUsize = AtomicUsize::new(0);
 static PABORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[inline(always)]
@@ -608,6 +625,7 @@ fn for_records2<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
     let (mut cm, mut qm, mut nm) = masks(0);
     let mut out: [S; N] = [&[]; N];
     let lmask: u64 = (2u64 << N) - 1;
+    let pfb = pfb_blocks();
     let mut bi = 0usize;
     while bi < nblk {
         let seg_end = (bi + SEG / 64).min(nblk);
@@ -617,6 +635,9 @@ fn for_records2<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
         if bnl.len() < wneed { bnl.resize(wneed, 0); bsq.resize(wneed, 0); beq.resize(wneed, 0); }
         // ---- stage 1 ----
         while bi < seg_end {
+            // v15c: software prefetch of the input PFB blocks ahead: the L2 streamer stops at every 4 KB page
+            // of the (page-cache backed) mapping, so each new page would otherwise start with a full miss.
+            if pfb != 0 && bi + pfb < full { unsafe { core::arch::x86_64::_mm_prefetch(base.add((bi + pfb) * 64) as *const i8, core::arch::x86_64::_MM_HINT_T0); } }
             let (cm1, qm1, nm1) = masks(bi + 1);
             let seps = cm | nm;
             let s_m = (seps << 1) | prev_sep_top;
@@ -1803,7 +1824,9 @@ fn main() {
                     if eid.is_empty() { return; }
                     let ing_ms = if fast_ts { parse_ts_fast(f[3], dtab).unwrap_or(i64::MAX) } else { parse_f1_fast(f[3]).unwrap_or_else(|| parse_ts(f[3]).unwrap_or(i64::MAX)) };
                     let ingest = if ing_ms == i64::MAX { u32::MAX } else { (ing_ms / 1000 - ibase).clamp(0, u32::MAX as i64) as u32 };
-                    let h = xxh3_128(eid);
+                    // v15: eh = xxh3_64 (64 bits, as before) and the bucket from an independent CRC32C of the bytes
+                    // (as before, 64 + 9 independent bits identify an event_id); xxh3_128 cost ~2% wall at 60M.
+                    let h = if eid128() { xxh3_128(eid) } else { (xxh3_64(eid) as u128) | (((crc_bucket(eid) as u64) << (64 - NBBITS)) as u128) << 64 };
                     local += 1;
                     // rid = raw event index for records that become events (fixed up to the scattered
                     // EvP slot below), NO_EV for records that never become an event
@@ -1951,6 +1974,15 @@ fn main() {
 
     // Phase 4: sessionize per person bucket
     let nthreads = rayon::current_num_threads();
+    let ud = outd.join("user_daily");
+    let cd = outd.join("campaign_daily");
+    std::fs::create_dir_all(&ud).unwrap();
+    std::fs::create_dir_all(&cd).unwrap();
+    let catnames: Vec<&str> = cats.iter().map(|c| std::str::from_utf8(c).unwrap_or("?")).collect();
+    // Row order and file count are free: a thread whose rows pass `flush_at` writes them out as a part
+    // file right away, so most of the output is written inside the sessionize phase (filling its tail).
+    let flush_at: usize = std::env::var("FLUSH").ok().and_then(|v| v.parse().ok()).unwrap_or(nrec / 7 / nthreads / 6 + 4096);
+    let flush_seq = AtomicUsize::new(0);
     let gdiv: usize = std::env::var("GDIV").ok().and_then(|v| v.parse().ok()).unwrap_or(4).max(1);
     let slots: Vec<std::sync::Mutex<Option<Acc>>> = (0..nthreads + 1).map(|_| std::sync::Mutex::new(None)).collect();
     // biggest buckets first for better balance
@@ -2030,45 +2062,57 @@ fn main() {
         process_bucket(&ctx, &keys, &mut cls, acc);
         acc.kbuf = keys;
         acc.clbuf = cls;
+        if flush_at > 0 && acc.rows.len() >= flush_at {
+            let k = flush_seq.fetch_add(1, Relaxed);
+            out::write_user(&ud.join(format!("part-f{:05}.parquet", k)), &acc.rows, &catnames);
+            acc.rows.clear();
+        }
     });
     let accs: Vec<Acc> = slots.into_iter().filter_map(|m| m.into_inner().unwrap()).collect();
     lap("sessionized");
     if verbose { eprintln!("  thread-ms gather {} sort {} proc {} regroups {} persons {} events {}", T_GATHER.load(Relaxed)/1000000, T_SORT.load(Relaxed)/1000000, T_PROC.load(Relaxed)/1000000, T_REGROUP.load(Relaxed), T_NP.load(Relaxed), T_NEV.load(Relaxed)); }
 
-    let ud = outd.join("user_daily");
-    let cd = outd.join("campaign_daily");
-    std::fs::create_dir_all(&ud).unwrap();
-    std::fs::create_dir_all(&cd).unwrap();
-    let catnames: Vec<&str> = cats.iter().map(|c| std::str::from_utf8(c).unwrap_or("?")).collect();
     lap("dirs");
+    let dontneed = || {
+        if std::env::var_os("NO_DONTNEED").is_none() {
+            // Drop the input files' page-table entries in parallel (madvise takes mmap_lock shared) so the
+            // single-threaded exit_mmap has little left to zap. Runs alongside the last writes when DN_JOIN is
+            // set (a writer touching a dropped name page just refaults it from the page cache).
+            files().par_iter().for_each(|f| {
+                if f.is_empty() { return; }
+                let mut p = f.as_ptr() as usize & !4095; let end = f.as_ptr() as usize + f.len();
+                while p < end { let n = (end - p).min(64 << 20); unsafe { libc::madvise(p as *mut libc::c_void, n, libc::MADV_DONTNEED); } p += n; }
+            });
+        }
+    };
+    let writes = || {
     rayon::join(
-        || {
-            // balanced pieces (~1/16 of all rows each, never spanning accs) so no writer thread lags
-            let total: usize = accs.iter().map(|a| a.rows.len()).sum();
-            let target = (total / 16).max(4096);
-            let mut pieces: Vec<&[URow]> = Vec::new();
-            for a in &accs { for p in a.rows.chunks(target) { pieces.push(p); } }
-            if pieces.is_empty() { pieces.push(&[]); }
-            pieces.par_iter().with_max_len(1).enumerate().for_each(|(k, p)| out::write_user(&ud.join(format!("part-{:05}.parquet", k)), p, &catnames));
-            lap("user files");
-        },
-        || {
-            let mut tot = vec![[0u64; 4]; (ctx.ncamp + 1) * ctx.ndays];
-            for a in &accs { for (i, (t, x)) in tot.iter_mut().zip(a.camp.iter()).enumerate() { for q in 0..3 { t[q] += x[q]; } t[3] += a.asst[i] as u64; } }
-            lap("camp summed");
-            out::write_campaign(&cd.join("part-00000.parquet"), &tot, &camps, ctx.ndays, ctx.ws_day);
-            lap("camp file");
-        },
-    );
-    lap("written");
-    if std::env::var_os("NO_DONTNEED").is_none() {
-        // Drop the input files' page-table entries in parallel (madvise takes mmap_lock shared) so the
-        // single-threaded exit_mmap has little left to zap. Nothing reads the maps after this point.
-        files().par_iter().for_each(|f| {
-            if f.is_empty() { return; }
-            let mut p = f.as_ptr() as usize & !4095; let end = f.as_ptr() as usize + f.len();
-            while p < end { let n = (end - p).min(64 << 20); unsafe { libc::madvise(p as *mut libc::c_void, n, libc::MADV_DONTNEED); } p += n; }
-        });
+            || {
+                // balanced pieces (~1/16 of all rows each, never spanning accs) so no writer thread lags
+                let total: usize = accs.iter().map(|a| a.rows.len()).sum();
+                let target = (total / 16).max(4096);
+                let mut pieces: Vec<&[URow]> = Vec::new();
+                for a in &accs { for p in a.rows.chunks(target) { pieces.push(p); } }
+                if pieces.is_empty() { pieces.push(&[]); }
+                pieces.par_iter().with_max_len(1).enumerate().for_each(|(k, p)| out::write_user(&ud.join(format!("part-{:05}.parquet", k)), p, &catnames));
+                lap("user files");
+            },
+            || {
+                let mut tot = vec![[0u64; 4]; (ctx.ncamp + 1) * ctx.ndays];
+                for a in &accs { for (i, (t, x)) in tot.iter_mut().zip(a.camp.iter()).enumerate() { for q in 0..3 { t[q] += x[q]; } t[3] += a.asst[i] as u64; } }
+                lap("camp summed");
+                out::write_campaign(&cd.join("part-00000.parquet"), &tot, &camps, ctx.ndays, ctx.ws_day);
+                lap("camp file");
+            },
+        );
+    };
+    if std::env::var_os("DN_JOIN").map(|v| v != "0").unwrap_or(true) {
+        rayon::join(writes, dontneed);
+        lap("written+dontneed");
+    } else {
+        writes();
+        lap("written");
+        dontneed();
         lap("dontneed");
     }
     if verbose { let st = std::fs::read_to_string("/proc/self/stat").unwrap_or_default(); let f: Vec<&str> = st.rsplit(") ").next().unwrap_or("").split(' ').collect(); eprintln!("  minflt {} majflt {} utime {} stime {}", f[7], f[9], f[11], f[12]); let ss = std::fs::read_to_string("/proc/self/status").unwrap_or_default(); for l in ss.lines() { if l.starts_with("VmHWM") || l.starts_with("RssAnon") || l.starts_with("RssFile") { eprintln!("  {}", l); } } }
