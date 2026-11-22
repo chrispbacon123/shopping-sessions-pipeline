@@ -991,7 +991,14 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
                 acc.rows.push(URow { name, day: cur_day as i32, sessions: d_sess, events: d_ev, rev: d_rev, top });
             }
         }}}
-        for &ok in ord.iter() {
+        // Prefetch loop for cache efficiency
+        const PF_DIST: usize = 8;
+        let nev = ord.len();
+        for (idx, &ok) in ord.iter().enumerate() {
+            if idx + PF_DIST < nev {
+                let future_idx = (ord[idx + PF_DIST] & 0xFFFF_FFFF) as usize;
+                unsafe { core::arch::x86_64::_mm_prefetch(pe.as_ptr().add(future_idx) as *const i8, core::arch::x86_64::_MM_HINT_T0); }
+            }
             let e = unsafe { pe.get_unchecked((ok & 0xFFFF_FFFF) as usize) };
             if first || e.ts - prev_ts > 1_800_000 {
                 if !first { close_session!(); }
