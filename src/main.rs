@@ -22,9 +22,6 @@ type S = &'static [u8];
 static T_GATHER: AtomicU64 = AtomicU64::new(0);
 static T_SORT: AtomicU64 = AtomicU64::new(0);
 static T_PROC: AtomicU64 = AtomicU64::new(0);
-static BRANCHY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static T_P: [AtomicU64; 6] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-fn tadd(i: usize, t: &mut Instant) { let n = Instant::now(); T_P[i].fetch_add((n - *t).as_nanos() as u64, Relaxed); *t = n; }
 static T_NP: AtomicU64 = AtomicU64::new(0);
 static T_NEV: AtomicU64 = AtomicU64::new(0);
 static T_REGROUP: AtomicU64 = AtomicU64::new(0);
@@ -483,22 +480,6 @@ fn for_records<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
         if nf == N {
             let mut quoted = 0u32;
             let mut bad = false;
-            if !BRANCHY.load(Relaxed) { // branchless quote handling
-            for k in 0..N {
-                let st = bnd[k] as usize;
-                let e = if k + 1 < N { bnd[k + 1] as usize - 1 } else { end };
-                let ne = (e > st) as usize;
-                // loads are clamped in-bounds; their results only count when the field is non-empty
-                let a = ((unsafe { *base.add(st.min(n - 1)) } == b'"') as usize) & ne;
-                let b = ((unsafe { *base.add(e.max(1) - 1) } == b'"') as usize) & ne;
-                let short = (e - st < 2) as usize;
-                bad |= ((a ^ b) | (a & short)) != 0;
-                quoted += a as u32;
-                let fs = st + a;
-                let fe = (e - a).max(fs);
-                out[k] = unsafe { std::slice::from_raw_parts(base.add(fs), fe - fs) };
-            }
-            } else {
             for k in 0..N {
                 let st = bnd[k] as usize;
                 let e = if k + 1 < N { bnd[k + 1] as usize - 1 } else { end };
@@ -513,7 +494,6 @@ fn for_records<const N: usize>(chunk: S, mut f: impl FnMut(&[S; N])) {
                     }
                 }
                 out[k] = unsafe { std::slice::from_raw_parts(base.add(fs), fe - fs) };
-            }
             }
             if !bad && ($qend - lq) == 2 * quoted { f(&out); }
         }
@@ -1058,14 +1038,27 @@ fn process_bucket(c: &Ctx<'_>, evs_in: &mut Vec<Ev>, cls_in: &mut Vec<Cl>, acc: 
 extern "C" { fn mi_option_set(option: i32, value: std::os::raw::c_long); }
 const MI_OPTION_PURGE_DELAY: i32 = 15; // mimalloc v2 mi_option_purge_delay
 
+/// Per-call readahead limit in KB for the block device holding `p`: max(max_sectors_kb,
+/// read_ahead_kb), clamped to [128, 4096]; 128 if sysfs doesn't tell.
+fn ra_limit_kb(p: &Path) -> usize {
+    use std::os::unix::fs::MetadataExt;
+    let dev = match std::fs::metadata(p) { Ok(m) => m.dev(), Err(_) => return 128 };
+    let (ma, mi) = (libc::major(dev), libc::minor(dev));
+    let rd = |f: &str| -> Option<usize> { std::fs::read_to_string(f).ok()?.trim().parse().ok() };
+    let base = format!("/sys/dev/block/{ma}:{mi}");
+    let q = |k: &str| rd(&format!("{base}/queue/{k}")).or_else(|| rd(&format!("{base}/../queue/{k}")));
+    let ms = q("max_sectors_kb").unwrap_or(0);
+    let ra = q("read_ahead_kb").or_else(|| rd(&format!("/sys/class/bdi/{ma}:{mi}/read_ahead_kb"))).unwrap_or(0);
+    let kb = ms.max(ra);
+    if kb == 0 { 128 } else { (kb.clamp(128, 4096) / 4) * 4 }
+}
+
 fn main() {
     // Never hand freed memory back to the OS mid-run: reused pages skip the kernel's zeroing and
     // avoid madvise/TLB-shootdown churn (measured ~3-5% wall at 20M).
     unsafe { mi_option_set(MI_OPTION_PURGE_DELAY, -1); }
     let t0 = Instant::now();
     let verbose = std::env::var("VERBOSE").is_ok();
-    BRANCHY.store(std::env::var_os("BRANCHY").is_some(), Relaxed);
-    if std::env::var_os("FUZZCSV").is_some() { fuzz_csv(); return; }
     let lap = |what: &str| if verbose { eprintln!("{:>8.1} ms  {}", t0.elapsed().as_secs_f64() * 1000.0, what) };
     let args: Vec<String> = std::env::args().collect();
     let data = PathBuf::from(if args.len() >= 3 { args[1].clone() } else { std::env::var("DATA_DIR").unwrap_or("/data".into()) });
@@ -1105,8 +1098,12 @@ fn main() {
     FILES.set(mapped).ok();
     // Background readahead in consumption order (small files, links, clicks, events): keeps the
     // disk queue full on a cold page cache while the main pipeline only ever waits on the head.
-    std::thread::spawn(|| {
-        let piece = 8usize << 20;
+    // MADV_WILLNEED reads at most max(io_pages, ra_pages) per call (force_page_cache_ra clamps the
+    // request), so bigger pieces silently prefetch only their head: v7's 8 MB pieces fetched ~1.25 MB
+    // of every 8 MB on a 1280 KB device. Use the device's limit when sysfs shows it, else 128 KB.
+    let piece = std::env::var("PF_PIECE_KB").ok().and_then(|s| s.parse().ok()).unwrap_or_else(|| ra_limit_kb(&data.join("events"))) << 10;
+    if verbose { eprintln!("prefetch piece {} KB", piece >> 10); }
+    std::thread::spawn(move || {
         for f in files() {
             let mut o = 0;
             while o < f.len() {
@@ -1173,7 +1170,6 @@ fn main() {
                 let ibase = base / 1000 - 40 * 86400;
                 let cid = (ci as u32) << lbits;
                 let mut local: u32 = 0;
-                let mut tt = Instant::now();
                 for_records::<7>(d, |f| {
                     let eid = f[0];
                     if eid.is_empty() { return; }
@@ -1205,31 +1201,22 @@ fn main() {
                     eb.push(Ev { pk: uh, ts: (ts - base) as u32, rid: cid, pc: price | ((cat as u32) << 24), name: noff });
                 });
                 assert!(local <= lmask, "chunk too large");
-                tadd(0, &mut tt);
                 people.resolve_all(eb, |e| e.pk, |e, pk, i| { e.pk = pk; e.name = (1u32 << 31) | i; });
-                tadd(1, &mut tt);
                 let evs = scatter_ev(eb, perm);
                 for r in kb.iter_mut() { if r.rid != NO_EV { r.rid = cid | unsafe { *perm.get_unchecked(r.rid as usize) }; } }
-                tadd(2, &mut tt);
-                let keys = scatter_b(kb, kbk);
-                tadd(3, &mut tt);
-                EvPart { keys, evs }
+                EvPart { keys: scatter_b(kb, kbk), evs }
     };
     let cl_job = |raw: &mut Vec<Cl>, c: &Chunk| -> (Vec<Cl>, Vec<u32>) {
                 let d = c.data();
                 raw.clear(); raw.reserve(d.len() / 45);
-                let mut tt = Instant::now();
                 for_records::<4>(d, |f| {
                     if f[0].is_empty() || f[1].is_empty() { return; }
                     let ts = match if fast_ts { parse_ts_fast(f[3], dtab) } else { parse_ts(f[3]) } { Some(t) if t >= cws && t < we => t, _ => return };
                     let camp = match clook.get(f[2]) { Some(c) => c, None => return };
                     raw.push(Cl { pk: hs(f[1]), cid: c.off(f[0]), ts: (ts - base) as u32, camp });
                 });
-                tadd(4, &mut tt);
                 resolve_clicks(&people, raw);
-                let r = scatter(raw, |r| bucket(r.pk));
-                tadd(5, &mut tt);
-                r
+                scatter(raw, |r| bucket(r.pk))
     };
     // Work queue in file order (clicks, then events) so consumption follows the prefetcher's read order.
     let ncl = cch.len();
@@ -1237,14 +1224,9 @@ fn main() {
     let next = AtomicUsize::new(0);
     let ev_slots: Vec<Mutex<Option<EvPart>>> = (0..ech.len()).map(|_| Mutex::new(None)).collect();
     let cl_slots: Vec<Mutex<Option<(Vec<Cl>, Vec<u32>)>>> = (0..ncl).map(|_| Mutex::new(None)).collect();
-    let tpar = Instant::now();
-    let tends: Vec<AtomicU64> = (0..64).map(|_| AtomicU64::new(0)).collect();
-    let tstarts: Vec<AtomicU64> = (0..64).map(|_| AtomicU64::new(0)).collect();
     rayon::scope(|sc| {
-        for w in 0..rayon::current_num_threads() {
-            let tends = &tends; let tstarts = &tstarts; let tpar = &tpar; let next = &next; let cl_slots = &cl_slots; let ev_slots = &ev_slots; let cl_job = &cl_job; let ev_job = &ev_job; let cch = &cch; let ech = &ech;
-            sc.spawn(move |_| {
-                tstarts[w].store(tpar.elapsed().as_micros() as u64, Relaxed);
+        for _ in 0..rayon::current_num_threads() {
+            sc.spawn(|_| {
                 let (mut kb, mut eb, mut kbk, mut perm) = (Vec::<KeyRec>::new(), Vec::<Ev>::new(), Vec::<u16>::new(), Vec::<u32>::new());
                 let mut cb = Vec::<Cl>::new();
                 loop {
@@ -1253,20 +1235,12 @@ fn main() {
                     if j < ncl { *cl_slots[j].lock().unwrap() = Some(cl_job(&mut cb, &cch[j])); }
                     else { let ci = j - ncl; *ev_slots[ci].lock().unwrap() = Some(ev_job(&mut kb, &mut eb, &mut kbk, &mut perm, ci, &ech[ci])); }
                 }
-                tends[w].store(tpar.elapsed().as_micros() as u64, Relaxed);
             });
         }
     });
     let mut ev_parts: Vec<EvPart> = ev_slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
     let cl_parts: Vec<(Vec<Cl>, Vec<u32>)> = cl_slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
     lap("events + clicks parsed");
-    if verbose {
-        let ms = |i: usize| T_P[i].load(Relaxed) / 1_000_000;
-        eprintln!("  thread-ms ev_parse {} resolve {} scat_ev {} scat_keys {} cl_parse {} cl_resolve+scat {}", ms(0), ms(1), ms(2), ms(3), ms(4), ms(5));
-        let n = rayon::current_num_threads();
-        eprintln!("  worker start(ms) {:?}", (0..n).map(|w| tstarts[w].load(Relaxed) / 1000).collect::<Vec<_>>());
-        eprintln!("  worker end(ms)   {:?}  chunks ev {} cl {}", (0..n).map(|w| tends[w].load(Relaxed) / 1000).collect::<Vec<_>>(), ech.len(), cch.len());
-    }
 
     // Phase 3: dedup on event_id -> loser bitmap
     // A losing copy that became an event gets its persisted EvP flagged (ts = u32::MAX). Each EvP has
@@ -1459,45 +1433,6 @@ fn bench(ev_fis: &[usize]) {
     for c in &ch { for_records::<7>(c.data(), |f| { acc += (xxh3_128(f[0]) as u64) ^ hs(f[1]); }); }
     eprintln!("records+hash {:.0} ms", t.elapsed().as_secs_f64()*1e3);
     eprintln!("{}", acc);
-}
-
-fn fuzz_csv() {
-    // branchless vs branchy field/quote handling must give identical records on adversarial input
-    let mut x: u64 = 0x9E3779B97F4A7C15;
-    let mut rnd = || { x ^= x << 13; x ^= x >> 7; x ^= x << 17; x };
-    let alpha = [b'a', b'b', b',', b'"', b'\n', b'"', b','];
-    let mut total = 0usize;
-    for it in 0..2_000_000u32 {
-        let mut buf: Vec<u8> = Vec::new();
-        let nlines = 1 + rnd() % 20;
-        for _ in 0..nlines {
-            let nf = 3 + (rnd() % 6) as usize; // 3..8 fields: hits 4 and 7 often
-            for k in 0..nf {
-                if k > 0 { buf.push(b','); }
-                let flen = (rnd() % 5) as usize;
-                let body: Vec<u8> = (0..flen).map(|_| { let r = rnd(); if r % 17 == 0 { b'"' } else { b'a' + (r % 26) as u8 } }).collect();
-                match rnd() % 6 {
-                    0 | 1 => { buf.push(b'"'); buf.extend_from_slice(&body); buf.push(b'"'); }
-                    2 => { buf.push(b'"'); buf.extend_from_slice(&body); }
-                    3 => { buf.extend_from_slice(&body); buf.push(b'"'); }
-                    _ => buf.extend_from_slice(&body),
-                }
-            }
-            if rnd() % 50 != 0 { buf.push(b'\n'); }
-        }
-        let buf: &'static [u8] = Box::leak(buf.into_boxed_slice());
-        let run = |br: bool| -> (Vec<Vec<Vec<u8>>>, Vec<Vec<Vec<u8>>>) {
-            BRANCHY.store(br, Relaxed);
-            let mut a = Vec::new(); let mut b = Vec::new();
-            for_records::<7>(buf, |f| a.push(f.iter().map(|x| x.to_vec()).collect()));
-            for_records::<4>(buf, |f| b.push(f.iter().map(|x| x.to_vec()).collect()));
-            (a, b)
-        };
-        let r1 = run(true); let r2 = run(false);
-        total += r1.0.len() + r1.1.len();
-        assert!(r1 == r2, "mismatch at iteration {}: {:?}", it, String::from_utf8_lossy(&buf));
-    }
-    eprintln!("fuzz_csv ok, {} records compared", total);
 }
 
 fn resolve_clicks(people: &People, raw: &mut [Cl]) {
