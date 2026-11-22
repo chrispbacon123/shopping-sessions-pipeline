@@ -60,6 +60,8 @@ fn prefetch_field(off: u64) {
 
 #[inline(always)]
 fn hs(b: &[u8]) -> u64 { let h = xxh3_64(b); if h == 0 { 1 } else { h } }
+static PINS: AtomicUsize = AtomicUsize::new(0);
+static PABORT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[inline(always)]
 fn bucket(h: u64) -> usize { (h >> (64 - NBBITS)) as usize }
 
@@ -975,6 +977,60 @@ impl Wc {
         _mm_sfence();
     }
 }
+
+/// v13b fuzz: concurrent lookup-or-insert on a small, collision-heavy people table. Checks every
+/// thread gets the same pid per key, linked keys keep their root pid, other keys own distinct slots
+/// holding that key, and offs of an inserted slot is the key's name.
+fn fuzz_pid() {
+    let iters: usize = std::env::var("FUZZN").ok().and_then(|v| v.parse().ok()).unwrap_or(300);
+    for it in 0..iters {
+        let mut st: u64 = 0x9E3779B97F4A7C15 ^ (it as u64).wrapping_mul(0x2545F4914F6CDD1D);
+        let mut rnd = move || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
+        let cap = 1usize << (6 + rnd() % 6);
+        let ppl = People { slots: zeroed_vec(cap), offs: zeroed_vec(cap), mask: cap - 1 };
+        let nkeys = (cap / 2).max(2);
+        // keys share low bits often so probe chains are long and wrap around
+        let low = rnd() & 7;
+        let keys: Vec<u64> = (0..nkeys).map(|_| { let k = rnd() | 1; if rnd() % 2 == 0 { (k & !(cap as u64 - 1)) | (cap as u64 - 1 - low) } else { k } }).collect();
+        let mut keys = keys; keys.sort(); keys.dedup();
+        // pre-insert some "linked" keys: groups pointing at the first key's slot as root
+        let nl = keys.len() / 3;
+        let mut root_of = std::collections::HashMap::new();
+        let mut i = 0;
+        while i < nl {
+            let g = (1 + rnd() % 3) as usize;
+            let r = ppl.insert(keys[i], 7);
+            for k in &keys[i..(i + g).min(nl)] { let q = ppl.insert(*k, 7); ppl.slots[q as usize].pk.store(r as u64 + 1, Relaxed); root_of.insert(*k, r); }
+            i += g;
+        }
+        let nth = 4;
+        let per: Vec<Vec<(u64, u32)>> = (0..nth).into_par_iter().map(|t| {
+            let mut s2: u64 = 0x1234567 ^ ((t as u64 + 1) * 0x9E37) ^ it as u64;
+            let mut items: Vec<u64> = (0..2000).map(|_| { s2 ^= s2 << 13; s2 ^= s2 >> 7; s2 ^= s2 << 17; keys[(s2 % keys.len() as u64) as usize] }).collect();
+            let orig = items.clone();
+            let mut out = Vec::new();
+            let mut pids = vec![0u32; items.len()];
+            let pp = pids.as_mut_ptr() as usize;
+            let base = items.as_ptr() as usize;
+            ppl.resolve_ins(&mut items, |&k| k, |_, &k| k ^ 0x55, |e, pid| unsafe { *(pp as *mut u32).add((e as *mut u64 as usize - base) / 8) = pid; });
+            for (k, p) in orig.iter().zip(pids) { out.push((*k, p)); }
+            out
+        }).collect();
+        let mut seen: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+        let mut owner: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+        for v in &per { for &(k, p) in v {
+            let e = *seen.entry(k).or_insert(p);
+            assert_eq!(e, p, "pid differs across threads for key {k:x} it {it}");
+            if let Some(&r) = root_of.get(&k) { assert_eq!(p, r, "linked key lost its root"); }
+            else {
+                assert_eq!(ppl.slots[p as usize].key.load(Relaxed), k, "pid slot holds another key");
+                assert_eq!(ppl.offs[p as usize].load(Relaxed), k ^ 0x55, "name");
+                if let Some(&o) = owner.get(&p) { assert_eq!(o, k, "two keys share a pid"); } else { owner.insert(p, k); }
+            }
+        } }
+    }
+    eprintln!("fuzz_pid ok, {} cases", iters);
+}
 fn fuzz_wc() {
     let mut st: u64 = 0x243F6A8885A308D3;
     let mut rnd = || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
@@ -1005,7 +1061,10 @@ fn fuzz_wc() {
         let skew = rnd() % 3;
         let shift = (rnd() % 64) as usize;
         let pick = |a: u64, b: u64, c: u64| -> usize { let _ = c; match skew { 0 => (a % nb as u64) as usize, 1 => if a % 4 == 0 { (b % NB as u64) as usize } else { 7 }, _ => ((a % nb as u64) * (b % nb as u64) % NB as u64) as usize } };
-        if it % 2 == 0 {
+        if it % 3 == 2 {
+            let items: Vec<(usize, [u32; 3])> = (0..n).map(|i| { let (a, b, c) = (rnd(), rnd(), rnd()); (pick(a, b, c), [i as u32, c as u32, it as u32]) }).collect();
+            one(&mut w, &items, shift);
+        } else if it % 2 == 0 {
             let items: Vec<(usize, [u32; 5])> = (0..n).map(|i| { let (a, b, c) = (rnd(), rnd(), rnd()); (pick(a, b, c), [i as u32, c as u32, (c >> 32) as u32, it as u32, !(i as u32)]) }).collect();
             one(&mut w, &items, shift);
         } else {
@@ -1055,28 +1114,34 @@ struct Ev { pk: u64, ts: u32, rid: u32, pc: u32, name: u32 } // pc = price | cat
 /// Persisted (bucket-scattered) event: 20 bytes, align 4. ts == u32::MAX marks a dedup loser.
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct EvP { pk_lo: u32, pk_hi: u32, ts: u32, pc: u32, name: u32 }
+struct EvP { pid: u32, ts: u32, pc: u32 }
+/// v13b: person bucket of a dense person id (people-table slot of the person's root / own ID).
+#[inline(always)]
+fn pbucket(pid: u64) -> usize { pid as usize & (NB - 1) }
+/// in-bucket hash of a person id (the low NBBITS are the bucket)
+#[inline(always)]
+fn pmh(pid: u64) -> usize { (pid >> NBBITS) as usize }
 const NO_EV: u32 = u32::MAX;
 /// Counting-sort scatter of raw events into NB person buckets as 20-byte EvP; perm[i] = output slot of v[i].
 fn scatter_ev(v: &[Ev], perm: &mut Vec<u32>) -> (OutBuf<EvP>, Vec<u32>) {
     let mut cnt = vec![0u32; NB + 1];
-    for x in v { cnt[bucket(x.pk) + 1] += 1; }
+    for x in v { cnt[pbucket(x.pk) + 1] += 1; }
     for i in 0..NB { cnt[i + 1] += cnt[i]; }
     perm.clear(); perm.reserve(v.len());
     let out = OutBuf::<EvP>::uninit(v.len());
     if wc_on() {
         unsafe { perm.set_len(v.len()); }
         let pp = perm.as_mut_ptr();
-        WC.with(|w| unsafe { w.borrow_mut().run(out.ptr, &cnt, v.len(), |i| { let x = v.get_unchecked(i); (bucket(x.pk), EvP { pk_lo: x.pk as u32, pk_hi: (x.pk >> 32) as u32, ts: x.ts, pc: x.pc, name: x.name }) }, |i, o| *pp.add(i) = o) });
+        WC.with(|w| unsafe { w.borrow_mut().run(out.ptr, &cnt, v.len(), |i| { let x = v.get_unchecked(i); (pbucket(x.pk), EvP { pid: x.pk as u32, ts: x.ts, pc: x.pc }) }, |i, o| *pp.add(i) = o) });
         return (out, cnt);
     }
     let mut pos = cnt.clone();
     unsafe {
         let p = out.ptr;
         for x in v {
-            let b = bucket(x.pk);
+            let b = pbucket(x.pk);
             let o = pos[b];
-            *p.add(o as usize) = EvP { pk_lo: x.pk as u32, pk_hi: (x.pk >> 32) as u32, ts: x.ts, pc: x.pc, name: x.name };
+            *p.add(o as usize) = EvP { pid: x.pk as u32, ts: x.ts, pc: x.pc };
             perm.push(o);
             pos[b] = o + 1;
         }
@@ -1165,6 +1230,36 @@ impl People {
             }
         }
     }
+    /// v13b: pipelined lookup-or-insert. Linked IDs (inserted by build_people) carry pk = root slot + 1;
+    /// any other ID gets its own slot (pk stays 0) on first sight, with its name offset stored in offs.
+    /// set(i, pid) gets the dense person id = root slot (linked) or own slot. Returns #inserted.
+    #[inline(always)]
+    fn resolve_ins<T>(&self, items: &mut [T], key: impl Fn(&T) -> u64, name: impl Fn(usize, &T) -> u64, mut set: impl FnMut(&mut T, u32)) -> usize {
+        const D: usize = 24;
+        let n = items.len();
+        let mut ins = 0usize;
+        for i in 0..n.min(D) { self.prefetch(key(&items[i])); }
+        for i in 0..n {
+            if i + D < n { self.prefetch(key(&items[i + D])); }
+            let h = key(&items[i]);
+            let mut q = h as usize & self.mask;
+            let pid = loop {
+                let sl = unsafe { self.slots.get_unchecked(q) };
+                let (k, pk) = (sl.key.load(Relaxed), sl.pk.load(Relaxed));
+                if k == h { break if pk == 0 { q as u32 } else { (pk - 1) as u32 }; }
+                if k == 0 {
+                    match sl.key.compare_exchange(0, h, Relaxed, Relaxed) {
+                        Ok(_) => { unsafe { self.offs.get_unchecked(q) }.store(name(i, &items[i]), Relaxed); ins += 1; break q as u32; }
+                        // a concurrent insert of an ID unknown to the links: its pk is 0 too
+                        Err(k2) => if k2 == h { break q as u32; },
+                    }
+                }
+                q = (q + 1) & self.mask;
+            };
+            set(&mut items[i], pid);
+        }
+        ins
+    }
     /// Returns (person key, name offset) or None if the ID is in no link.
     #[inline(always)]
     fn get(&self, h: u64) -> Option<(u64, u64)> {
@@ -1179,10 +1274,11 @@ impl People {
     }
 }
 
-fn build_people(link_fis: &[usize]) -> People {
+fn build_people(link_fis: &[usize], min_cap: usize) -> People {
     let tq = Instant::now(); let vb = std::env::var_os("VERBOSE").is_some(); let tl = |w: &str| if vb { eprintln!("      people.{} {:.1} ms", w, tq.elapsed().as_secs_f64()*1e3) };
     let ch = chunks(link_fis, 1 << 20);
-    let pairs: Vec<Vec<(u64, u64, u64, u64)>> = ch.par_iter().map(|c| {
+    // v13b: zero the (input-sized) table while the links parse (on a cold cache that parse waits on I/O)
+    let (pairs, pre): (Vec<Vec<(u64, u64, u64, u64)>>, (Vec<Slot>, Vec<AtomicU64>, Vec<AtomicU32>)) = rayon::join(|| ch.par_iter().map(|c| {
         let d = c.data();
         let mut v = Vec::with_capacity(d.len() / 20);
         for_records2::<2>(d, |f| {
@@ -1190,12 +1286,15 @@ fn build_people(link_fis: &[usize]) -> People {
             v.push((hs(f[0]), c.off(f[0]), hs(f[1]), c.off(f[1])));
         });
         v
-    }).collect();
+    }).collect(), || (zeroed_vec(min_cap), zeroed_vec(min_cap), zeroed_vec(min_cap)));
     tl("s1");
     let total: usize = pairs.iter().map(|v| v.len()).sum();
-    let cap = (total * 2 + 16).next_power_of_two(); // distinct IDs <= 2*pairs, so the table never fills
-    let ppl = People { slots: zeroed_vec(cap), offs: zeroed_vec(cap), mask: cap - 1 };
-    let parent: Vec<AtomicU32> = zeroed_vec(cap); // 0 = root, else parent+1
+    let cap = (total * 2 + 16).next_power_of_two().max(min_cap); // v13b: also holds every event/click ID
+    let (ppl, parent) = if cap == min_cap { (People { slots: pre.0, offs: pre.1, mask: cap - 1 }, pre.2) } else {
+        drop(pre);
+        (People { slots: zeroed_vec(cap), offs: zeroed_vec(cap), mask: cap - 1 }, zeroed_vec::<AtomicU32>(cap))
+    };
+    let parent: Vec<AtomicU32> = parent; // 0 = root, else parent+1
     if vb { eprintln!("      pairs {} cap {}", total, cap); }
     tl("alloc");
     let find = |mut x: u32| -> u32 {
@@ -1246,7 +1345,7 @@ fn build_people(link_fis: &[usize]) -> People {
         let s = &ppl.slots[i];
         let off = s.pk.load(Relaxed) - 1;
         ppl.offs[i].store(off, Relaxed);
-        s.pk.store(hs(field_at(off)), Relaxed);
+        s.pk.store(i as u64 + 1, Relaxed); // v13b: dense person id = root slot
     });
     tl("s4");
     (0..cap).into_par_iter().with_min_len(4096).for_each(|i| {
@@ -1363,7 +1462,7 @@ fn process_bucket(c: &Ctx<'_>, keys: &[u64], cls_in: &mut Vec<Cl>, acc: &mut Acc
     acc.cpid.clear();
     for cc in acc.cnt.iter_mut() { *cc = 0; }
     for cl in cls_in.iter() {
-        let mut q = (cl.pk as usize) & mask;
+        let mut q = pmh(cl.pk) & mask;
         let id = loop {
             let m = &acc.map[q];
             if m.1 == u32::MAX { break u32::MAX; }
@@ -1584,6 +1683,7 @@ fn main() {
     assert!(we - base < u32::MAX as i64, "window too long for u32 relative ms");
     if std::env::var_os("FUZZTS").is_some() { fuzz_ts(ws, we); return; }
     if std::env::var_os("FUZZCSV").is_some() { fuzz_csv2(); return; }
+    if std::env::var_os("FUZZPID").is_some() { fuzz_pid(); return; }
     let fast_ts = std::env::var_os("NO_FASTTS").is_none();
     let dtab_v = DateTab::new(ws_day - 12, (we - 1).div_euclid(DAY) + 12);
     let dtab = &dtab_v;
@@ -1641,6 +1741,21 @@ fn main() {
         return;
     }
 
+    // v13b: the people table also takes every event/click user ID. If inserts pass 90% of the table
+    // the run restarts itself with a 4x table (PCAP_X), so a bad estimate costs time, never exactness.
+    let pcap = {
+        let fl = files();
+        // generator: ~1 distinct linked ID per 20 B of links, ~0.14 unlinked IDs per KB of events+clicks
+        // (d60: 3.59M + 0.85M). Estimate with ~40% margin; the table is a power of 2 at or above it.
+        let lnb: usize = fl[2..2 + ln_p.len()].iter().map(|f| f.len()).sum();
+        let ecb: usize = fl[2 + ln_p.len()..].iter().map(|f| f.len()).sum();
+        let est = lnb / 16 + ecb / 10000 * 3 + 4096;
+        let x: usize = std::env::var("PCAP_X").ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+        // PCAP_DIV / PCAP_MINBITS: test knobs to force the overflow + re-exec path
+        let div: usize = std::env::var("PCAP_DIV").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+        let mb: u32 = std::env::var("PCAP_MINBITS").ok().and_then(|v| v.parse().ok()).unwrap_or(22);
+        (est.next_power_of_two() * x.max(1) / div).max(1 << mb)
+    };
     let small = |fi: usize| -> Vec<(S, S)> {
         let mut v = Vec::new();
         let mut f: [S; 2] = [&[]; 2];
@@ -1661,7 +1776,7 @@ fn main() {
         let mut clook = Lookup::new(b"c_");
         for (i, &(cid, _)) in camps.iter().enumerate() { clook.insert(cid, i as u16); }
         (cats, unknown_cat, plook, camps, clook)
-    }, || build_people(&ln_fis));
+    }, || build_people(&ln_fis, pcap));
     lap("people built");
 
     // Phase 2: events + clicks parse (people resolved inline)
@@ -1715,7 +1830,9 @@ fn main() {
                 });
                 assert!(local <= lmask, "chunk too large");
                 let t1 = Instant::now();
-                people.resolve_all(eb, |e| e.pk, |e, pk, i| { e.pk = pk; e.name = (1u32 << 31) | i; });
+                let gb = ((c.fi as u64) << 40) | cbase as u64;
+                let ins = people.resolve_ins(eb, |e| e.pk, |_, e| gb + e.name as u64, |e, pid| e.pk = pid as u64);
+                PINS.fetch_add(ins, Relaxed);
                 let t2 = Instant::now();
                 let evs = scatter_ev(eb, perm);
                 for r in kb.iter_mut() { if r.rid != NO_EV { r.rid = cid | unsafe { *perm.get_unchecked(r.rid as usize) }; } }
@@ -1724,20 +1841,28 @@ fn main() {
                 T_EP.fetch_add((t1-tj).as_nanos() as u64, Relaxed); T_ER.fetch_add((t2-t1).as_nanos() as u64, Relaxed); T_ES.fetch_add((t3-t2).as_nanos() as u64, Relaxed);
                 r
     };
-    let cl_job = |raw: &mut Vec<Cl>, c: &Chunk| -> (Vec<Cl>, Vec<u32>) {
+    let cl_job = |raw: &mut Vec<Cl>, cnm: &mut Vec<u64>, c: &Chunk| -> (Vec<Cl>, Vec<u32>) {
                 let d = c.data(); let tc = Instant::now();
-                raw.clear(); raw.reserve(d.len() / 45);
+                raw.clear(); raw.reserve(d.len() / 45); cnm.clear();
                 for_records2::<4>(d, |f| {
                     if f[0].is_empty() || f[1].is_empty() { return; }
                     let ts = match if fast_ts { parse_ts_fast(f[3], dtab) } else { parse_ts(f[3]) } { Some(t) if t >= cws && t < we => t, _ => return };
                     let camp = match clook.get(f[2]) { Some(c) => c, None => return };
                     raw.push(Cl { pk: hs(f[1]), cid: c.off(f[0]), ts: (ts - base) as u32, camp });
+                    cnm.push(c.off(f[1]));
                 });
-                resolve_clicks(&people, raw);
-                let r = scatter(raw, |r| bucket(r.pk)); T_CL.fetch_add(tc.elapsed().as_nanos() as u64, Relaxed); r
+                let ins = people.resolve_ins(raw, |e| e.pk, |i, _| unsafe { *cnm.get_unchecked(i) }, |e, pid| e.pk = pid as u64);
+                PINS.fetch_add(ins, Relaxed);
+                let r = scatter(raw, |r| pbucket(r.pk)); T_CL.fetch_add(tc.elapsed().as_nanos() as u64, Relaxed); r
     };
     // Work queue in file order (clicks, then events) so consumption follows the prefetcher's read order.
     let ncl = cch.len();
+    // overflow guard: linked IDs already in the table + inserts must stay under 90% (<= 8 chunks in flight
+    // add at most ~0.6M more, so probing always terminates)
+    let nused = people.slots.par_iter().with_min_len(1 << 16).filter(|s| s.key.load(Relaxed) != 0).count();
+    let plim = ((people.mask + 1) / 10 * 9).saturating_sub(nused);
+    if verbose { eprintln!("  people linked IDs {} cap {} insert limit {}", nused, people.mask + 1, plim); } // 80% load: never fills (<= 8 chunks in flight)
+    if verbose { eprintln!("  people cap {}", people.mask + 1); }
     let njobs = ncl + ech.len();
     let next = AtomicUsize::new(0);
     let ev_slots: Vec<Mutex<Option<EvPart>>> = (0..ech.len()).map(|_| Mutex::new(None)).collect();
@@ -1746,16 +1871,27 @@ fn main() {
         for _ in 0..rayon::current_num_threads() {
             sc.spawn(|_| {
                 let (mut kb, mut eb, mut kbk, mut perm) = (Vec::<KeyRec>::new(), Vec::<Ev>::new(), Vec::<u16>::new(), Vec::<u32>::new());
-                let mut cb = Vec::<Cl>::new();
+                let (mut cb, mut cnm) = (Vec::<Cl>::new(), Vec::<u64>::new());
                 loop {
                     let j = next.fetch_add(1, Relaxed);
                     if j >= njobs { break; }
-                    if j < ncl { *cl_slots[j].lock().unwrap() = Some(cl_job(&mut cb, &cch[j])); }
+                    if PINS.load(Relaxed) > plim { PABORT.store(true, Relaxed); break; }
+                    if j < ncl { *cl_slots[j].lock().unwrap() = Some(cl_job(&mut cb, &mut cnm, &cch[j])); }
                     else { let ci = j - ncl; *ev_slots[ci].lock().unwrap() = Some(ev_job(&mut kb, &mut eb, &mut kbk, &mut perm, ci, &ech[ci])); }
                 }
             });
         }
     });
+    // PTEST_ABORT: test knob, forces one overflow restart
+    if PABORT.load(Relaxed) || PINS.load(Relaxed) > plim || (std::env::var_os("PTEST_ABORT").is_some() && std::env::var_os("PCAP_X").is_none()) {
+        // people table too small for this input: rerun with a 4x larger one (nothing written yet)
+        use std::os::unix::process::CommandExt;
+        let x: usize = std::env::var("PCAP_X").ok().and_then(|v| v.parse().ok()).unwrap_or(1).max(1);
+        if verbose { eprintln!("people table cap {} too small ({} inserts), re-exec x{}", people.mask + 1, PINS.load(Relaxed), x * 4); }
+        let e = std::process::Command::new(std::env::current_exe().unwrap()).args(&args[1..]).env("PCAP_X", (x * 4).to_string()).exec();
+        panic!("re-exec failed: {e}");
+    }
+    if verbose { eprintln!("  people inserts {} (cap {})", PINS.load(Relaxed), people.mask + 1); }
     let mut ev_parts: Vec<EvPart> = ev_slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
     let cl_parts: Vec<(Vec<Cl>, Vec<u32>)> = cl_slots.into_iter().map(|m| m.into_inner().unwrap().unwrap()).collect();
     arena::STOP.store(true, Relaxed);
@@ -1862,15 +1998,15 @@ fn main() {
                 let crid = (ci as u32) << lbits;
                 for ep in &v[off[b] as usize..off[b + 1] as usize] {
                     if ep.ts == u32::MAX { continue; }
-                    let pk = (ep.pk_lo as u64) | ((ep.pk_hi as u64) << 32);
-                    let mut q = (pk as usize) & mask;
+                    let pk = ep.pid as u64;
+                    let mut q = pmh(pk) & mask;
                     let id = loop {
                         let m = unsafe { acc.map.get_unchecked_mut(q) };
                         if m.1 == u32::MAX {
                             if np >= lim { ok = false; break 'parts; }
                             *m = (pk, np); np += 1; acc.cnt.push(0);
                             // first event of this person in gather order: (name, rid) for the output name
-                            acc.pnames.push(((ep.name as u64) << 32) | (crid as u64));
+                            acc.pnames.push((((1u64 << 31) | pk) << 32) | (crid as u64));
                             break m.1;
                         }
                         if m.0 == pk { break m.1; }
